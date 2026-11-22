@@ -73,6 +73,11 @@ export default function ImprimirPlacasPage() {
         </button>
       </header>
 
+      {placas.length === 0 && (
+        <p className="rounded-2xl border border-dashed border-neutral-300 bg-white px-6 py-14 text-center text-[15px] text-neutral-500 print:hidden">
+          Este hotel no tiene placas activas para imprimir. Agrega habitaciones o activa sus placas en la ficha del hotel.
+        </p>
+      )}
       <div className="grid grid-cols-2 justify-items-center gap-6 print:gap-0">
         {placas.map((p) => (
           <article

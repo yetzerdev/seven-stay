@@ -48,6 +48,11 @@ export default function ControlHabitaciones() {
         </span>
       </div>
 
+      {habitaciones.length === 0 && (
+        <p className="rounded-xl border border-dashed border-neutral-300 px-4 py-6 text-center text-[14px] leading-relaxed text-neutral-500">
+          Todavía no hay habitaciones. Seven Stay las agrega junto con sus placas QR.
+        </p>
+      )}
       <ul className="grid grid-cols-4 gap-2">
         {habitaciones.map((h) => {
           const estado = estadoDe(h);

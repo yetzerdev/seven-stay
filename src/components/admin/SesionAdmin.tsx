@@ -42,11 +42,14 @@ const Contexto = createContext<ValorSesionAdmin | null>(null);
 
 /** Promesa que se cumple cuando el servidor confirma que la sesión es del equipo. */
 function crearEspera() {
-  let cumplir = () => {};
-  const promesa = new Promise<void>((r) => {
-    cumplir = r;
+  const espera = { cumplida: false, cumplir: () => {}, promesa: Promise.resolve() };
+  espera.promesa = new Promise<void>((resolver) => {
+    espera.cumplir = () => {
+      espera.cumplida = true;
+      resolver();
+    };
   });
-  return { promesa, cumplir };
+  return espera;
 }
 
 export function useAdmin(): ValorSesionAdmin {
@@ -80,7 +83,16 @@ export function SesionAdminProvider({ children }: { children: ReactNode }) {
   const llamar = useCallback(
     async <N extends NombreAccion>(accion: N, entrada: AccionesAdmin[N]['entrada']): Promise<AccionesAdmin[N]['salida']> => {
       if (!cliente) throw new Error('Supabase no está configurado.');
-      if (accion !== 'yo') await verificado.current.promesa;
+      // Las páginas piden datos antes de que termine la verificación (sobre todo al abrir
+      // una pestaña nueva: PDF de factura, cotización, libro, placas). Esperan aquí hasta
+      // que la verificación VIGENTE se cumpla, aunque la espera se haya renovado mientras tanto.
+      if (accion !== 'yo') {
+        for (;;) {
+          const espera = verificado.current;
+          await espera.promesa;
+          if (verificado.current === espera) break;
+        }
+      }
       const { data } = await cliente.auth.getSession(); // renueva el token si venció
       const token = data.session?.access_token;
       if (!token) throw new Error('Inicia sesión.');
@@ -105,8 +117,11 @@ export function SesionAdminProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!uid) return;
     let vivo = true;
-    const espera = crearEspera();
-    verificado.current = espera; // otro usuario o reintento: se vuelve a esperar
+    // Error de antes: aquí se creaba SIEMPRE una espera nueva, y las páginas que ya
+    // esperaban la anterior se quedaban cargando para siempre. Ahora solo se renueva
+    // si la anterior ya se cumplió (cambio de usuario o reintento).
+    if (verificado.current.cumplida) verificado.current = crearEspera();
+    const espera = verificado.current;
     llamar('yo', null).then(
       (admin) => {
         if (!vivo) return;

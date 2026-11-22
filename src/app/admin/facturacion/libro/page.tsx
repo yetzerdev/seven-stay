@@ -83,6 +83,13 @@ export default function LibroVentasPage() {
             </tr>
           </thead>
           <tbody>
+            {r.facturas.length === 0 && (
+              <tr>
+                <td colSpan={10} className="px-2 py-6 text-center text-neutral-500">
+                  No se emitieron facturas en este periodo.
+                </td>
+              </tr>
+            )}
             {r.facturas.map((f) => {
               const i = importesLibro(f);
               return (
