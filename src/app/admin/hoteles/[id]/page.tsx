@@ -235,7 +235,8 @@ export default function HotelAdminPage() {
               modo_tours: hotel.modo_tours,
               whatsapp_reception: hotel.whatsapp_reception,
               rtn: hotel.rtn,
-              plan_id: hotel.plan_id,
+              plan_saas: hotel.plan_saas,
+              gratis_hasta: hotel.gratis_hasta,
               habitaciones_contratadas: hotel.habitaciones_contratadas,
             }}
             textoGuardar="Guardar cambios"

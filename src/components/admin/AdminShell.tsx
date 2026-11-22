@@ -17,7 +17,7 @@ const ENLACES = [
   { href: '/admin/monitoreo', texto: 'Monitoreo', operaciones: true },
   { href: '/admin/metricas', texto: 'Métricas' },
   { href: '/admin/tours', texto: 'Tours y reservas', operaciones: true },
-  { href: '/admin/cobros', texto: 'Cobros' },
+  { href: '/admin/facturacion', texto: 'Facturación' },
   { href: '/admin/bitacora', texto: 'Bitácora' },
 ];
 

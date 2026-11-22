@@ -1,4 +1,18 @@
 import { createClient, type SupabaseClient, type User } from '@supabase/supabase-js';
+
+import {
+  categoriaPorHabitaciones,
+  CONCEPTOS,
+  cotizarMensualidad,
+  cotizarPlacas,
+  montoEnLetras,
+  PLACAS,
+  PLANES_SAAS,
+  r2,
+  totalesSar,
+  type Concepto,
+  type PlanSaas,
+} from '@/lib/facturacion/tarifas';
 import type { NextRequest } from 'next/server';
 
 import type {
@@ -7,14 +21,17 @@ import type {
   EstadoPlaca,
   EstadoReserva,
   HotelResumen,
-  CobroHotel,
+  ConfigFiscal,
+  Cotizacion,
+  EstadoCai,
   EntradaBitacora,
-  MetodoPago,
+  Factura,
+  MetodoPagoFactura,
   MetricaHotel,
   MonitoreoHotel,
   NombreAccion,
-  PagoHotel,
-  Plan,
+  NuevaFactura,
+  Suscripcion,
   RolAdmin,
   RolUsuarioHotel,
   TourSevenStay,
@@ -88,7 +105,11 @@ function sumarMeses(fecha: string, meses: number): string {
 
 const diasEntre = (desde: string, hasta: string) => Math.round((Date.parse(hasta) - Date.parse(desde)) / 86_400_000);
 
-const METODOS: MetodoPago[] = ['transferencia', 'efectivo', 'tarjeta', 'otro'];
+const METODOS_FACTURA: MetodoPagoFactura[] = ['transferencia', 'deposito', 'cheque'];
+const PLANES: PlanSaas[] = ['boutique', 'estandar', 'resort'];
+const CONCEPTOS_VALIDOS = Object.keys(CONCEPTOS) as Concepto[];
+const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+const esFecha = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
 const minutos = (desde: string, hasta: string) => (new Date(hasta).getTime() - new Date(desde).getTime()) / 60_000;
 
@@ -121,18 +142,179 @@ function limpiarHotel(d: DatosHotelAdmin): DatosHotelAdmin {
     // Solo dígitos (formato E.164 sin "+"); vacío = sin bot.
     whatsapp_reception: String(d.whatsapp_reception ?? '').replace(/\D/g, '').slice(0, 15),
     rtn: String(d.rtn ?? '').replace(/[^\d-]/g, '').slice(0, 20),
-    plan_id: esUuid(d.plan_id) ? d.plan_id : null,
+    plan_saas: PLANES.includes(d.plan_saas as PlanSaas) ? d.plan_saas : null,
+    gratis_hasta: esFecha(d.gratis_hasta) ? d.gratis_hasta : '',
     habitaciones_contratadas: Math.min(5000, Math.max(0, Math.trunc(Number(d.habitaciones_contratadas) || 0))),
   };
 }
 
-/** Tarifa congelada que corresponde al plan elegido (o ninguna si se quita el plan). */
-async function tarifaDePlan(db: SupabaseClient, planId: string | null) {
-  if (!planId) return { tarifa_habitacion: null, tarifa_moneda: null };
-  const { data, error } = await db.from('planes').select('precio_habitacion, moneda').eq('id', planId).maybeSingle();
+// ---------------------------------------------------------------------------
+// Facturación
+// ---------------------------------------------------------------------------
+
+const sumarDias = (fecha: string, dias: number) => {
+  const d = new Date(`${fecha}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + dias);
+  return d.toISOString().slice(0, 10);
+};
+
+/** "2026-11-15" → "Noviembre 2026" */
+const etiquetaMes = (fecha: string) => {
+  const nombre = MESES[Number(fecha.slice(5, 7)) - 1];
+  return `${nombre[0].toUpperCase()}${nombre.slice(1)} ${fecha.slice(0, 4)}`;
+};
+
+type FilaConfig = ConfigFiscal & { correlativo_actual: number | null };
+
+async function leerConfigFiscal(db: SupabaseClient): Promise<FilaConfig> {
+  const { data, error } = await db.from('config_fiscal').select('*').eq('id', 1).maybeSingle();
+  if (error && /config_fiscal/.test(error.message)) {
+    throw new ErrorAdmin('Falta la tabla de facturación: corre la migración 20261126000000_facturacion_sar.sql en Supabase.', 500);
+  }
   revisar(error);
-  if (!data) throw new ErrorAdmin('Ese plan no existe.');
-  return { tarifa_habitacion: Number(data.precio_habitacion), tarifa_moneda: data.moneda as string };
+  return exigir(data as FilaConfig | null, 'Falta la configuración fiscal.');
+}
+
+function aConfig(c: FilaConfig): ConfigFiscal {
+  return {
+    nombre_legal: c.nombre_legal,
+    denominacion: c.denominacion,
+    rtn: c.rtn,
+    domicilio: c.domicilio,
+    telefono: c.telefono,
+    correo: c.correo,
+    cai: c.cai,
+    rango_inicial: c.rango_inicial,
+    rango_final: c.rango_final,
+    fecha_limite: c.fecha_limite,
+    registro_sag: c.registro_sag,
+    banco: c.banco,
+    tipo_cuenta: c.tipo_cuenta,
+    numero_cuenta: c.numero_cuenta,
+    titular: c.titular,
+  };
+}
+
+function estadoCai(c: FilaConfig): EstadoCai {
+  const base = { correlativo_actual: c.correlativo_actual === null ? null : Number(c.correlativo_actual), siguiente: null, restantes: null, dias_para_limite: null };
+  if (!c.rtn || !c.cai || !c.rango_inicial || !c.rango_final || !c.fecha_limite) {
+    return { ...base, bloqueo: 'Completa RTN, CAI, rango autorizado y fecha límite para poder emitir facturas.' };
+  }
+  const dias = diasEntre(hoyISO(), c.fecha_limite);
+  const inicial = Number(c.rango_inicial.slice(11));
+  const final = Number(c.rango_final.slice(11));
+  const siguiente = Math.max(c.correlativo_actual === null ? inicial : Number(c.correlativo_actual) + 1, inicial);
+  const restantes = final - siguiente + 1;
+  return {
+    ...base,
+    siguiente: restantes > 0 ? `${c.rango_inicial.slice(0, 11)}${String(siguiente).padStart(8, '0')}` : null,
+    restantes: Math.max(0, restantes),
+    dias_para_limite: dias,
+    bloqueo: dias < 0 ? 'La fecha límite de emisión del CAI ya pasó.' : restantes <= 0 ? 'Se terminó el rango autorizado del CAI.' : null,
+  };
+}
+
+function aCotizacion(c: Record<string, unknown>): Cotizacion {
+  return {
+    id: String(c.id),
+    numero: String(c.numero),
+    creado_at: String(c.creado_at),
+    hotel_id: (c.hotel_id as string | null) ?? null,
+    cliente_nombre: String(c.cliente_nombre),
+    cliente_rtn: String(c.cliente_rtn ?? ''),
+    ciudad: String(c.ciudad ?? ''),
+    contacto: String(c.contacto ?? ''),
+    habitaciones: Number(c.habitaciones),
+    tipo_placa: (c.tipo_placa as Cotizacion['tipo_placa']) ?? null,
+    plan_saas: (c.plan_saas as Cotizacion['plan_saas']) ?? null,
+    bonificacion_piloto: Boolean(c.bonificacion_piloto),
+    notas: String(c.notas ?? ''),
+    estado: c.estado as Cotizacion['estado'],
+    convertida_hotel_id: (c.convertida_hotel_id as string | null) ?? null,
+  };
+}
+
+function aFactura(f: Record<string, unknown>): Factura {
+  const n = (v: unknown) => Number(v ?? 0);
+  const estado = f.estado === 'pendiente' && String(f.vence) < hoyISO() ? 'vencida' : (f.estado as Factura['estado']);
+  return {
+    id: String(f.id),
+    numero: String(f.numero),
+    cai: String(f.cai),
+    rango_inicial: String(f.rango_inicial),
+    rango_final: String(f.rango_final),
+    fecha_limite: String(f.fecha_limite),
+    emisor: f.emisor as Factura['emisor'],
+    fecha_emision: String(f.fecha_emision),
+    condicion: f.condicion as Factura['condicion'],
+    vence: String(f.vence),
+    hotel_id: (f.hotel_id as string | null) ?? null,
+    cotizacion_id: (f.cotizacion_id as string | null) ?? null,
+    cliente_nombre: String(f.cliente_nombre),
+    cliente_rtn: String(f.cliente_rtn ?? ''),
+    cliente_direccion: String(f.cliente_direccion ?? ''),
+    lineas: (f.lineas as Factura['lineas']) ?? [],
+    descuentos: n(f.descuentos),
+    importe_exento: n(f.importe_exento),
+    importe_exonerado: n(f.importe_exonerado),
+    importe_gravado: n(f.importe_gravado),
+    isv: n(f.isv),
+    total: n(f.total),
+    total_letras: String(f.total_letras),
+    orden_compra_exenta: String(f.orden_compra_exenta ?? ''),
+    constancia_exonerado: String(f.constancia_exonerado ?? ''),
+    registro_sag: String(f.registro_sag ?? ''),
+    mensualidad_meses: f.mensualidad_meses === null || f.mensualidad_meses === undefined ? null : n(f.mensualidad_meses),
+    estado,
+    pago_fecha: (f.pago_fecha as string | null) ?? null,
+    pago_metodo: (f.pago_metodo as Factura['pago_metodo']) ?? null,
+    pago_referencia: String(f.pago_referencia ?? ''),
+    retencion: n(f.retencion),
+    retencion_comprobante: String(f.retencion_comprobante ?? ''),
+    anulada_motivo: String(f.anulada_motivo ?? ''),
+    emitida_por: String(f.emitida_por ?? ''),
+  };
+}
+
+/** Hoteles activos con su mensualidad, próximo corte y estado de cobro. */
+async function cargarSuscripciones(db: SupabaseClient): Promise<Suscripcion[]> {
+  const [hoteles, rooms, pendientes] = await Promise.all([
+    db.from('hotels').select('id, nombre, rtn, estado, plan_saas, habitaciones_contratadas, pagado_hasta, gratis_hasta').eq('estado', 'activo').order('nombre'),
+    db.from('rooms').select('hotel_id'),
+    db.from('facturas').select('hotel_id, numero').eq('estado', 'pendiente').not('mensualidad_meses', 'is', null),
+  ]);
+  [hoteles, rooms, pendientes].forEach((x) => revisar(x.error));
+  const hoy = hoyISO();
+  return (hoteles.data ?? []).map((h): Suscripcion => {
+    const habitaciones = Math.max(h.habitaciones_contratadas ?? 0, (rooms.data ?? []).filter((r) => r.hotel_id === h.id).length);
+    const plan: PlanSaas = h.plan_saas ?? categoriaPorHabitaciones(habitaciones);
+    const precio = cotizarMensualidad(plan);
+    const enGratis = Boolean(h.gratis_hasta && h.gratis_hasta >= hoy);
+    const corte = h.pagado_hasta ?? h.gratis_hasta ?? null;
+    let estado: Suscripcion['estado'];
+    let mora = 0;
+    if (enGratis && (!h.pagado_hasta || h.pagado_hasta < h.gratis_hasta)) estado = 'gratis';
+    else if (!corte || corte < hoy) {
+      estado = 'vencido';
+      mora = corte ? diasEntre(corte, hoy) : 0;
+    } else estado = diasEntre(hoy, corte) <= 7 ? 'por_vencer' : 'al_dia';
+    return {
+      hotel_id: h.id,
+      nombre: h.nombre,
+      cliente_rtn: h.rtn ?? '',
+      plan,
+      plan_automatico: !h.plan_saas,
+      habitaciones,
+      subtotal: precio.subtotal,
+      total: precio.total,
+      pagado_hasta: h.pagado_hasta,
+      gratis_hasta: h.gratis_hasta,
+      proximo_corte: corte,
+      dias_mora: mora,
+      estado,
+      factura_pendiente: (pendientes.data ?? []).find((f) => f.hotel_id === h.id)?.numero ?? null,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +358,7 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
   hoteles: async (_e, { db }) => {
     const inicioHoy = new Date(Date.now() - 24 * 3_600_000).toISOString();
     const [hoteles, rooms, staff, tickets] = await Promise.all([
-      db.from('hotels').select('id, nombre, logo_url, estado, modo_tours, creado_at, plan_id, pagado_hasta').order('nombre'),
+      db.from('hotels').select('id, nombre, logo_url, estado, modo_tours, creado_at, pagado_hasta, gratis_hasta').order('nombre'),
       db.from('rooms').select('hotel_id, estado_placa'),
       db.from('hotel_staff').select('hotel_id').not('user_id', 'is', null),
       db.from('tickets').select('hotel_id').gte('creado_at', inicioHoy),
@@ -192,7 +374,7 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
         estado: h.estado,
         modo_tours: h.modo_tours,
         creado_at: h.creado_at,
-        pago_vencido: Boolean(h.plan_id && (!h.pagado_hasta || h.pagado_hasta < hoyISO())),
+        pago_vencido: Boolean(h.pagado_hasta && h.pagado_hasta < hoyISO() && !(h.gratis_hasta && h.gratis_hasta >= hoyISO())),
         habitaciones: contar(rooms.data, h.id),
         placas_activas: contar(rooms.data, h.id, (r) => r.estado_placa === 'activa'),
         usuarios: contar(staff.data, h.id),
@@ -241,7 +423,8 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
         modo_tours: h.modo_tours,
         whatsapp_reception: h.whatsapp_reception ?? '',
         rtn: h.rtn ?? '',
-        plan_id: h.plan_id ?? null,
+        plan_saas: h.plan_saas ?? null,
+        gratis_hasta: h.gratis_hasta ?? '',
         habitaciones_contratadas: h.habitaciones_contratadas ?? 0,
       },
       habitaciones: (rooms.data ?? [])
@@ -263,15 +446,10 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
     const limpio = limpiarHotel(datos);
     if (id) {
       if (!esUuid(id)) throw new ErrorAdmin('Hotel inválido.');
-      const { data: actual, error } = await db.from('hotels').select('plan_id').eq('id', id).maybeSingle();
-      revisar(error);
-      // Solo si cambia de plan se toma el precio del plan nuevo; si no, se respeta la tarifa acordada.
-      const tarifa = actual && actual.plan_id !== limpio.plan_id ? await tarifaDePlan(db, limpio.plan_id) : {};
-      revisar((await db.from('hotels').update({ ...limpio, ...tarifa }).eq('id', id)).error);
+      revisar((await db.from('hotels').update({ ...limpio, gratis_hasta: limpio.gratis_hasta || null }).eq('id', id)).error);
       return { id };
     }
-    const tarifa = await tarifaDePlan(db, limpio.plan_id);
-    const { data, error } = await db.from('hotels').insert({ ...limpio, ...tarifa }).select('id').single();
+    const { data, error } = await db.from('hotels').insert({ ...limpio, gratis_hasta: limpio.gratis_hasta || null }).select('id').single();
     revisar(error);
     return { id: data!.id };
   },
@@ -686,186 +864,346 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
     return { hoteles: porHotel, ventas_tours: meses };
   },
 
-  planes: async (_e, { db }) => {
-    const { data, error } = await db.from('planes').select('*').order('precio_habitacion');
-    revisar(error);
-    return (data ?? []).map(
-      (p): Plan => ({
-        id: p.id,
-        nombre: p.nombre,
-        descripcion: p.descripcion,
-        precio_habitacion: Number(p.precio_habitacion),
-        moneda: p.moneda,
-        activo: p.activo,
-      }),
-    );
+  configFiscal: async (_e, { db }) => {
+    const c = await leerConfigFiscal(db);
+    return { config: aConfig(c), estado: estadoCai(c) };
   },
 
-  guardarPlan: async ({ id, aplicar_a_actuales, ...p }, { db }) => {
-    const nombre = String(p.nombre ?? '').trim().slice(0, 60);
-    if (!nombre) throw new ErrorAdmin('El plan necesita un nombre.');
-    const precio = Number(p.precio_habitacion);
-    if (!Number.isFinite(precio) || precio < 0) throw new ErrorAdmin('Precio por habitación inválido.');
-    const fila = {
-      nombre,
-      descripcion: String(p.descripcion ?? '').trim().slice(0, 300),
-      precio_habitacion: Math.round(precio * 100) / 100,
-      moneda: p.moneda === 'HNL' ? 'HNL' : 'USD',
-      activo: Boolean(p.activo),
-    };
-    if (id) {
-      if (!esUuid(id)) throw new ErrorAdmin('Plan inválido.');
-      revisar((await db.from('planes').update(fila).eq('id', id)).error);
-      // Los hoteles conservan su tarifa acordada, salvo que se pida actualizarlos.
-      let actualizados = 0;
-      if (aplicar_a_actuales) {
-        const { data, error } = await db
-          .from('hotels')
-          .update({ tarifa_habitacion: fila.precio_habitacion, tarifa_moneda: fila.moneda })
-          .eq('plan_id', id)
-          .select('id');
-        revisar(error);
-        actualizados = data?.length ?? 0;
-      }
-      return { id, actualizados };
+  guardarConfigFiscal: async (d, { db }) => {
+    const texto = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max);
+    const rtn = texto(d.rtn, 14).toUpperCase();
+    const cai = texto(d.cai, 37).toUpperCase();
+    const inicial = texto(d.rango_inicial, 19);
+    const final = texto(d.rango_final, 19);
+    if (rtn && !/^[0-9A-Z]{14}$/.test(rtn)) throw new ErrorAdmin('El RTN debe tener 14 caracteres.');
+    if (cai && !/^[0-9A-F]{6}(-[0-9A-F]{6}){4}-[0-9A-F]{2}$/.test(cai)) throw new ErrorAdmin('El CAI debe tener el formato XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XX.');
+    for (const r of [inicial, final]) {
+      if (r && !/^\d{3}-\d{3}-\d{2}-\d{8}$/.test(r)) throw new ErrorAdmin('Los rangos deben tener el formato 000-001-01-00000001.');
     }
-    const { data, error } = await db.from('planes').insert(fila).select('id').single();
-    revisar(error);
-    return { id: data!.id, actualizados: 0 };
-  },
-
-  cobros: async (_e, { db }) => {
-    const [hoteles, planes, rooms, pagos] = await Promise.all([
-      db.from('hotels').select('id, nombre, estado, plan_id, pagado_hasta, tarifa_habitacion, tarifa_moneda, habitaciones_contratadas').order('nombre'),
-      db.from('planes').select('id, precio_habitacion, moneda'),
-      db.from('rooms').select('hotel_id').eq('estado_placa', 'activa'),
-      db.from('pagos_hotel').select('hotel_id, fecha_pago').order('fecha_pago', { ascending: false }),
-    ]);
-    [hoteles, planes, rooms, pagos].forEach((r) => revisar(r.error));
-    const hoy = hoyISO();
-    return (hoteles.data ?? []).map((h): CobroHotel => {
-      const plan = (planes.data ?? []).find((p) => p.id === h.plan_id);
-      const activas = (rooms.data ?? []).filter((r) => r.hotel_id === h.id).length;
-      // Se cobra el mayor entre lo contratado y las placas activas (pasar placas a bodega no baja la cuota).
-      const cobradas = Math.max(h.habitaciones_contratadas ?? 0, activas);
-      const tarifa = plan ? (h.tarifa_habitacion !== null ? Number(h.tarifa_habitacion) : Number(plan.precio_habitacion)) : null;
-      let estado_cobro: CobroHotel['estado_cobro'] = 'sin_plan';
-      let dias: number | null = null;
-      if (plan) {
-        if (!h.pagado_hasta || h.pagado_hasta < hoy) {
-          estado_cobro = 'vencido';
-          dias = h.pagado_hasta ? diasEntre(h.pagado_hasta, hoy) : null;
-        } else {
-          dias = diasEntre(hoy, h.pagado_hasta);
-          estado_cobro = dias <= 7 ? 'por_vencer' : 'al_dia';
-        }
-      }
-      return {
-        id: h.id,
-        nombre: h.nombre,
-        estado_hotel: h.estado,
-        plan_id: h.plan_id,
-        habitaciones_activas: activas,
-        habitaciones_contratadas: h.habitaciones_contratadas ?? 0,
-        habitaciones_cobradas: cobradas,
-        tarifa_habitacion: tarifa,
-        mensualidad: tarifa !== null ? Math.round(tarifa * cobradas * 100) / 100 : null,
-        moneda: plan ? (h.tarifa_moneda ?? plan.moneda) : null,
-        pagado_hasta: h.pagado_hasta,
-        estado_cobro,
-        dias,
-        ultimo_pago: (pagos.data ?? []).find((p) => p.hotel_id === h.id)?.fecha_pago ?? null,
-      };
-    });
-  },
-
-  asignarPlan: async ({ hotel_id, plan_id }, { db }) => {
-    if (!esUuid(hotel_id) || (plan_id !== null && !esUuid(plan_id))) throw new ErrorAdmin('Solicitud inválida.');
-    revisar((await db.from('hotels').update({ plan_id, ...(await tarifaDePlan(db, plan_id)) }).eq('id', hotel_id)).error);
-    return null;
-  },
-
-  ajustarCobro: async ({ hotel_id, habitaciones_contratadas, tarifa_habitacion }, { db }) => {
-    if (!esUuid(hotel_id)) throw new ErrorAdmin('Hotel inválido.');
-    const contratadas = Math.trunc(Number(habitaciones_contratadas));
-    if (!(contratadas >= 0 && contratadas <= 5000)) throw new ErrorAdmin('Habitaciones contratadas inválidas.');
-    const tarifa = tarifa_habitacion === null ? null : Number(tarifa_habitacion);
-    if (tarifa !== null && (!Number.isFinite(tarifa) || tarifa < 0)) throw new ErrorAdmin('Tarifa inválida.');
+    if (inicial && final) {
+      if (inicial.slice(0, 11) !== final.slice(0, 11)) throw new ErrorAdmin('El rango inicial y el final deben ser del mismo establecimiento, punto y tipo (los primeros 11 caracteres).');
+      if (Number(final.slice(11)) < Number(inicial.slice(11))) throw new ErrorAdmin('El rango final no puede ser menor que el inicial.');
+    }
+    if (d.fecha_limite && !esFecha(d.fecha_limite)) throw new ErrorAdmin('Fecha límite inválida.');
+    const anterior = await leerConfigFiscal(db);
+    // CAI o rango nuevos: el correlativo vuelve a empezar desde el rango inicial autorizado.
+    const reiniciar = anterior.cai !== cai || anterior.rango_inicial !== inicial;
     revisar(
       (
         await db
-          .from('hotels')
-          .update({ habitaciones_contratadas: contratadas, tarifa_habitacion: tarifa === null ? null : Math.round(tarifa * 100) / 100 })
-          .eq('id', hotel_id)
+          .from('config_fiscal')
+          .update({
+            nombre_legal: texto(d.nombre_legal, 120) || 'YETZER BANEGAS',
+            denominacion: texto(d.denominacion, 120),
+            rtn,
+            domicilio: texto(d.domicilio, 300),
+            telefono: texto(d.telefono, 40),
+            correo: texto(d.correo, 120),
+            cai,
+            rango_inicial: inicial,
+            rango_final: final,
+            fecha_limite: d.fecha_limite || null,
+            registro_sag: texto(d.registro_sag, 60),
+            banco: texto(d.banco, 80),
+            tipo_cuenta: texto(d.tipo_cuenta, 60),
+            numero_cuenta: texto(d.numero_cuenta, 60),
+            titular: texto(d.titular, 120),
+            ...(reiniciar ? { correlativo_actual: null } : {}),
+            actualizado_at: new Date().toISOString(),
+          })
+          .eq('id', 1)
       ).error,
     );
     return null;
   },
 
-  registrarPago: async (p, { db, admin }) => {
-    if (!esUuid(p.hotel_id)) throw new ErrorAdmin('Hotel inválido.');
-    const monto = Number(p.monto);
-    if (!Number.isFinite(monto) || monto <= 0) throw new ErrorAdmin('Escribe el monto pagado.');
-    const meses = Math.trunc(Number(p.meses));
-    if (!(meses >= 1 && meses <= 24)) throw new ErrorAdmin('Los meses pagados deben ser entre 1 y 24.');
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(p.fecha_pago))) throw new ErrorAdmin('Fecha de pago inválida.');
-    if (!METODOS.includes(p.metodo)) throw new ErrorAdmin('Método de pago inválido.');
-
-    const { data: hotel, error } = await db.from('hotels').select('pagado_hasta').eq('id', p.hotel_id).maybeSingle();
+  cotizaciones: async (_e, { db }) => {
+    const { data, error } = await db.from('cotizaciones').select('*').order('creado_at', { ascending: false }).limit(300);
     revisar(error);
-    if (!hotel) throw new ErrorAdmin('Ese hotel no existe.');
-    // El periodo pagado sigue donde terminó el anterior; si ya estaba vencido, arranca hoy.
-    const hoy = hoyISO();
-    const desde = hotel.pagado_hasta && hotel.pagado_hasta > hoy ? hotel.pagado_hasta : hoy;
-    const hasta = sumarMeses(desde, meses);
-
-    revisar(
-      (
-        await db.from('pagos_hotel').insert({
-          hotel_id: p.hotel_id,
-          monto: Math.round(monto * 100) / 100,
-          moneda: p.moneda === 'HNL' ? 'HNL' : 'USD',
-          fecha_pago: p.fecha_pago,
-          meses,
-          periodo_desde: desde,
-          periodo_hasta: hasta,
-          metodo: p.metodo,
-          referencia: String(p.referencia ?? '').trim().slice(0, 120),
-          notas: String(p.notas ?? '').trim().slice(0, 300),
-          registrado_por: admin.nombre,
-          // Factura SAR: el monto incluye 15 % de ISV → se guarda el desglose.
-          incluye_isv: Boolean(p.incluye_isv),
-          subtotal: p.incluye_isv ? Math.round((monto / 1.15) * 100) / 100 : null,
-          isv: p.incluye_isv ? Math.round((monto - monto / 1.15) * 100) / 100 : null,
-        })
-      ).error,
-    );
-    revisar((await db.from('hotels').update({ pagado_hasta: hasta }).eq('id', p.hotel_id)).error);
-    return { pagado_hasta: hasta };
+    return (data ?? []).map(aCotizacion);
   },
 
-  pagosHotel: async ({ hotel_id }, { db }) => {
-    if (!esUuid(hotel_id)) throw new ErrorAdmin('Hotel inválido.');
-    const { data, error } = await db.from('pagos_hotel').select('*').eq('hotel_id', hotel_id).order('fecha_pago', { ascending: false }).limit(100);
+  cotizacion: async ({ id }, { db }) => {
+    if (!esUuid(id)) throw new ErrorAdmin('Cotización inválida.');
+    const { data, error } = await db.from('cotizaciones').select('*').eq('id', id).maybeSingle();
     revisar(error);
-    return (data ?? []).map(
-      (x): PagoHotel => ({
-        id: x.id,
-        monto: Number(x.monto),
-        moneda: x.moneda,
-        fecha_pago: x.fecha_pago,
-        meses: x.meses,
-        periodo_desde: x.periodo_desde,
-        periodo_hasta: x.periodo_hasta,
-        metodo: x.metodo,
-        referencia: x.referencia,
-        notas: x.notas,
-        registrado_por: x.registrado_por,
-        incluye_isv: Boolean(x.incluye_isv),
-        subtotal: x.subtotal === null ? null : Number(x.subtotal),
-        isv: x.isv === null ? null : Number(x.isv),
-      }),
+    return { cotizacion: aCotizacion(exigir(data, 'Esa cotización no existe.')), emisor: aConfig(await leerConfigFiscal(db)) };
+  },
+
+  guardarCotizacion: async ({ id, ...c }, { db, admin }) => {
+    const texto = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max);
+    const nombre = texto(c.cliente_nombre, 120);
+    if (!nombre) throw new ErrorAdmin('Escribe el nombre del hotel o la razón social.');
+    const habitaciones = Math.trunc(Number(c.habitaciones));
+    if (!(habitaciones >= 1 && habitaciones <= 5000)) throw new ErrorAdmin('Escribe la cantidad de habitaciones.');
+    if (!c.tipo_placa && !c.plan_saas) throw new ErrorAdmin('Elige al menos un tipo de placa o una mensualidad.');
+    const fila = {
+      cliente_nombre: nombre,
+      cliente_rtn: texto(c.cliente_rtn, 14).toUpperCase(),
+      ciudad: texto(c.ciudad, 80),
+      contacto: texto(c.contacto, 120),
+      habitaciones,
+      tipo_placa: c.tipo_placa === 'esencial' || c.tipo_placa === 'ejecutiva' ? c.tipo_placa : null,
+      plan_saas: PLANES.includes(c.plan_saas as PlanSaas) ? c.plan_saas : null,
+      bonificacion_piloto: Boolean(c.bonificacion_piloto),
+      notas: texto(c.notas, 600),
+      hotel_id: esUuid(c.hotel_id) ? c.hotel_id : null,
+    };
+    if (id) {
+      if (!esUuid(id)) throw new ErrorAdmin('Cotización inválida.');
+      revisar((await db.from('cotizaciones').update(fila).eq('id', id)).error);
+      return { id };
+    }
+    const { data, error } = await db.from('cotizaciones').insert({ ...fila, creado_por: admin.nombre }).select('id').single();
+    revisar(error);
+    return { id: data!.id };
+  },
+
+  convertirCotizacion: async ({ id, dar_alta }, { db }) => {
+    if (!esUuid(id)) throw new ErrorAdmin('Cotización inválida.');
+    const { data, error } = await db.from('cotizaciones').select('*').eq('id', id).maybeSingle();
+    revisar(error);
+    const c = aCotizacion(exigir(data, 'Esa cotización no existe.'));
+    let hotelId = c.hotel_id ?? c.convertida_hotel_id;
+    if (dar_alta && !hotelId) {
+      // Alta del hotel con lo que trae la cotización; el resto lo completa Seven Stay en su ficha.
+      const gratis = c.bonificacion_piloto ? sumarMeses(hoyISO(), 1) : null;
+      const { data: nuevo, error: errorAlta } = await db
+        .from('hotels')
+        .insert({
+          nombre: c.cliente_nombre,
+          rtn: c.cliente_rtn,
+          habitaciones_contratadas: c.habitaciones,
+          plan_saas: c.plan_saas && c.plan_saas !== categoriaPorHabitaciones(c.habitaciones) ? c.plan_saas : null,
+          gratis_hasta: gratis,
+          moneda_default: 'HNL',
+        })
+        .select('id')
+        .single();
+      revisar(errorAlta);
+      hotelId = nuevo!.id;
+    }
+    revisar(
+      (await db.from('cotizaciones').update({ estado: 'convertida', ...(hotelId ? { convertida_hotel_id: hotelId } : {}) }).eq('id', id)).error,
     );
+    // Borrador de la factura de anticipo (50 % de las placas); si no cotizó placas, la primera mensualidad.
+    const lineas: NuevaFactura['lineas'] = [];
+    if (c.tipo_placa) {
+      const p = cotizarPlacas(c.tipo_placa, c.habitaciones);
+      lineas.push({
+        cantidad: 1,
+        descripcion: `${CONCEPTOS.anticipo_placas} — ${PLACAS[c.tipo_placa].nombre}: ${c.habitaciones} placas × L. ${p.unitario.toFixed(2)}`,
+        precio_unitario: r2(p.subtotal / 2),
+        concepto: 'anticipo_placas',
+      });
+    } else if (c.plan_saas) {
+      lineas.push({
+        cantidad: 1,
+        descripcion: `${CONCEPTOS.mensualidad} — Plan ${PLANES_SAAS[c.plan_saas].nombre} — ${etiquetaMes(hoyISO())}`,
+        precio_unitario: PLANES_SAAS[c.plan_saas].mensual,
+        concepto: 'mensualidad',
+      });
+    }
+    return {
+      hotel_id: hotelId ?? null,
+      borrador: {
+        hotel_id: hotelId ?? null,
+        cotizacion_id: c.id,
+        cliente_nombre: c.cliente_nombre,
+        cliente_rtn: c.cliente_rtn,
+        cliente_direccion: c.ciudad,
+        condicion: 'contado',
+        vence: sumarDias(hoyISO(), 7),
+        lineas,
+        orden_compra_exenta: '',
+        constancia_exonerado: '',
+        registro_sag: '',
+        mensualidad_meses: lineas[0]?.concepto === 'mensualidad' ? 1 : null,
+      },
+    };
+  },
+
+  facturas: async ({ desde, hasta }, { db }) => {
+    let consulta = db.from('facturas').select('*').order('fecha_emision', { ascending: false }).order('correlativo', { ascending: false }).limit(2000);
+    if (esFecha(desde)) consulta = consulta.gte('fecha_emision', desde);
+    if (esFecha(hasta)) consulta = consulta.lte('fecha_emision', hasta);
+    const { data, error } = await consulta;
+    revisar(error);
+    return (data ?? []).map(aFactura);
+  },
+
+  factura: async ({ id }, { db }) => {
+    if (!esUuid(id)) throw new ErrorAdmin('Factura inválida.');
+    const { data, error } = await db.from('facturas').select('*').eq('id', id).maybeSingle();
+    revisar(error);
+    return aFactura(exigir(data, 'Esa factura no existe.'));
+  },
+
+  emitirFactura: async (f, { db, admin }) => {
+    const texto = (v: unknown, max: number) => String(v ?? '').trim().slice(0, max);
+    const cliente = texto(f.cliente_nombre, 160);
+    if (!cliente) throw new ErrorAdmin('Escribe la razón social o el nombre del hotel.');
+    const rtn = texto(f.cliente_rtn, 14).toUpperCase();
+    if (rtn && !/^[0-9A-Z]{14}$/.test(rtn)) throw new ErrorAdmin('El RTN del cliente debe tener 14 caracteres (o déjalo vacío para consumidor final).');
+    if (f.condicion !== 'contado' && f.condicion !== 'credito') throw new ErrorAdmin('Condición de pago inválida.');
+    if (!esFecha(f.vence) || f.vence < hoyISO()) throw new ErrorAdmin('La fecha de vencimiento no puede ser anterior a hoy.');
+    if (!Array.isArray(f.lineas) || f.lineas.length === 0 || f.lineas.length > 30) throw new ErrorAdmin('La factura necesita entre 1 y 30 líneas.');
+    const lineas = f.lineas.map((l) => {
+      const cantidad = Number(l.cantidad);
+      const precio = r2(Number(l.precio_unitario));
+      const descripcion = texto(l.descripcion, 300);
+      if (!descripcion) throw new ErrorAdmin('Cada línea necesita una descripción.');
+      if (!(cantidad > 0 && cantidad <= 100000)) throw new ErrorAdmin('Cantidad inválida en una línea.');
+      if (!Number.isFinite(precio) || precio < 0) throw new ErrorAdmin('Precio inválido en una línea.');
+      return {
+        cantidad,
+        descripcion,
+        precio_unitario: precio,
+        total: r2(cantidad * precio),
+        concepto: CONCEPTOS_VALIDOS.includes(l.concepto) ? l.concepto : 'libre',
+      };
+    });
+    const totales = totalesSar(lineas);
+    if (totales.total <= 0) throw new ErrorAdmin('El total de la factura debe ser mayor que cero.');
+    const meses = f.mensualidad_meses ? Math.trunc(Number(f.mensualidad_meses)) : null;
+    const { data, error } = await db.rpc('emitir_factura', {
+      p_factura: {
+        ...totales,
+        condicion: f.condicion,
+        vence: f.vence,
+        hotel_id: esUuid(f.hotel_id) ? f.hotel_id : '',
+        cotizacion_id: esUuid(f.cotizacion_id) ? f.cotizacion_id : '',
+        cliente_nombre: cliente,
+        cliente_rtn: rtn,
+        cliente_direccion: texto(f.cliente_direccion, 300),
+        lineas,
+        total_letras: montoEnLetras(totales.total),
+        orden_compra_exenta: texto(f.orden_compra_exenta, 60),
+        constancia_exonerado: texto(f.constancia_exonerado, 60),
+        registro_sag: texto(f.registro_sag, 60),
+        mensualidad_meses: meses && meses >= 1 && meses <= 24 && esUuid(f.hotel_id) ? meses : '',
+        emitida_por: admin.nombre,
+      },
+    });
+    if (error) {
+      const avisos: Record<string, string> = {
+        config_incompleta: 'Falta completar la Configuración Fiscal (RTN, CAI, rango y fecha límite) antes de emitir.',
+        cai_vencido: 'La fecha límite de emisión del CAI ya pasó: solicita un CAI nuevo a la SAR y actualízalo en Configuración Fiscal.',
+        rango_agotado: 'Se terminó el rango autorizado del CAI: solicita un rango nuevo a la SAR.',
+        rango_invalido: 'El rango autorizado de la Configuración Fiscal no es válido.',
+      };
+      const clave = Object.keys(avisos).find((k) => error.message.includes(k));
+      throw new ErrorAdmin(clave ? avisos[clave] : error.message);
+    }
+    const emitida = data as { id: string; numero: string };
+    return { id: emitida.id, numero: emitida.numero };
+  },
+
+  pagarFactura: async ({ id, fecha, metodo, referencia, retencion, retencion_comprobante }, { db }) => {
+    if (!esUuid(id)) throw new ErrorAdmin('Factura inválida.');
+    if (!esFecha(fecha) || fecha > hoyISO()) throw new ErrorAdmin('Fecha de pago inválida.');
+    if (!METODOS_FACTURA.includes(metodo)) throw new ErrorAdmin('Método de pago inválido.');
+    const ret = r2(Number(retencion) || 0);
+    const { data: f, error } = await db.from('facturas').select('estado, total, hotel_id, mensualidad_meses').eq('id', id).maybeSingle();
+    revisar(error);
+    if (!f) throw new ErrorAdmin('Esa factura no existe.');
+    if (f.estado !== 'pendiente') throw new ErrorAdmin('Solo una factura pendiente se puede marcar como pagada.');
+    if (ret < 0 || ret >= Number(f.total)) throw new ErrorAdmin('La retención debe ser menor que el total de la factura.');
+    revisar(
+      (
+        await db
+          .from('facturas')
+          .update({
+            estado: 'pagada',
+            pago_fecha: fecha,
+            pago_metodo: metodo,
+            pago_referencia: String(referencia ?? '').trim().slice(0, 80),
+            retencion: ret,
+            retencion_comprobante: String(retencion_comprobante ?? '').trim().slice(0, 80),
+          })
+          .eq('id', id)
+      ).error,
+    );
+    // Mensualidad pagada: el hotel queda al día por los meses que cubre.
+    let pagadoHasta: string | null = null;
+    if (f.mensualidad_meses && f.hotel_id) {
+      const { data: h } = await db.from('hotels').select('pagado_hasta, gratis_hasta').eq('id', f.hotel_id).maybeSingle();
+      if (h) {
+        const hoy = hoyISO();
+        const desde = [h.pagado_hasta, h.gratis_hasta, hoy].filter(Boolean).sort().at(-1)!;
+        pagadoHasta = sumarMeses(desde, f.mensualidad_meses);
+        revisar((await db.from('hotels').update({ pagado_hasta: pagadoHasta }).eq('id', f.hotel_id)).error);
+      }
+    }
+    return { pagado_hasta: pagadoHasta };
+  },
+
+  anularFactura: async ({ id, motivo }, { db }) => {
+    if (!esUuid(id)) throw new ErrorAdmin('Factura inválida.');
+    const m = String(motivo ?? '').trim().slice(0, 200);
+    if (!m) throw new ErrorAdmin('Escribe el motivo de la anulación.');
+    const { data: f, error } = await db.from('facturas').select('estado').eq('id', id).maybeSingle();
+    revisar(error);
+    if (!f) throw new ErrorAdmin('Esa factura no existe.');
+    if (f.estado !== 'pendiente') throw new ErrorAdmin('Solo se puede anular una factura pendiente de pago.');
+    // Nunca se borra: conserva su número correlativo, marcada como ANULADA (auditoría SAR).
+    revisar((await db.from('facturas').update({ estado: 'anulada', anulada_motivo: m, anulada_at: new Date().toISOString() }).eq('id', id)).error);
+    return null;
+  },
+
+  suscripciones: async (_e, { db }) => cargarSuscripciones(db),
+
+  borradorMensualidad: async ({ hotel_id }, { db }) => {
+    if (!esUuid(hotel_id)) throw new ErrorAdmin('Hotel inválido.');
+    const s = (await cargarSuscripciones(db)).find((x) => x.hotel_id === hotel_id);
+    if (!s) throw new ErrorAdmin('Ese hotel no está activo.');
+    const inicio = [s.pagado_hasta, s.gratis_hasta, hoyISO()].filter(Boolean).sort().at(-1)!;
+    return {
+      hotel_id,
+      cotizacion_id: null,
+      cliente_nombre: s.nombre,
+      cliente_rtn: s.cliente_rtn,
+      cliente_direccion: '',
+      condicion: 'credito',
+      vence: s.proximo_corte && s.proximo_corte >= hoyISO() ? s.proximo_corte : sumarDias(hoyISO(), 7),
+      lineas: [
+        {
+          cantidad: 1,
+          descripcion: `${CONCEPTOS.mensualidad} — Plan ${PLANES_SAAS[s.plan].nombre} — ${etiquetaMes(inicio)}`,
+          precio_unitario: s.subtotal,
+          concepto: 'mensualidad',
+        },
+      ],
+      orden_compra_exenta: '',
+      constancia_exonerado: '',
+      registro_sag: '',
+      mensualidad_meses: 1,
+    };
+  },
+
+  reporteFiscal: async ({ desde, hasta }, { db }) => {
+    if (!esFecha(desde) || !esFecha(hasta) || desde > hasta) throw new ErrorAdmin('Rango de fechas inválido.');
+    const [enRango, pagadas, pendientes, subs] = await Promise.all([
+      db.from('facturas').select('*').gte('fecha_emision', desde).lte('fecha_emision', hasta).order('fecha_emision').order('correlativo').limit(5000),
+      db.from('facturas').select('total, retencion').eq('estado', 'pagada').gte('pago_fecha', desde).lte('pago_fecha', hasta).limit(5000),
+      db.from('facturas').select('total').eq('estado', 'pendiente').limit(5000),
+      cargarSuscripciones(db),
+    ]);
+    [enRango, pagadas, pendientes].forEach((x) => revisar(x.error));
+    const facturas = (enRango.data ?? []).map(aFactura);
+    const validas = facturas.filter((f) => f.estado !== 'anulada');
+    const suma = (xs: number[]) => r2(xs.reduce((a, b) => a + b, 0));
+    return {
+      desde,
+      hasta,
+      facturado: suma(validas.map((f) => f.importe_gravado + f.importe_exento + f.importe_exonerado)),
+      isv: suma(validas.map((f) => f.isv)),
+      cobrado: suma((pagadas.data ?? []).map((f) => Number(f.total) - Number(f.retencion))),
+      retenciones: suma((pagadas.data ?? []).map((f) => Number(f.retencion))),
+      por_cobrar: suma((pendientes.data ?? []).map((f) => Number(f.total))),
+      mrr: suma(subs.filter((x) => x.estado !== 'gratis').map((x) => x.subtotal)),
+      facturas,
+    };
   },
 
   bitacora: async ({ hotel_id }, { db }) => {
@@ -907,7 +1245,7 @@ const ESTADOS_RESERVA_TEXTO: Record<string, string> = { pendiente_pago: 'Pendien
 const ACCIONES_REGISTRADAS = new Set<NombreAccion>([
   'guardarHotel', 'estadoHotel', 'eliminarHotel', 'crearHabitaciones', 'editarHabitacion', 'reemplazarPlaca', 'eliminarHabitacion',
   'invitarUsuario', 'enlaceAcceso', 'cambiarRol', 'quitarUsuario', 'guardarTour', 'eliminarTour', 'estadoReserva',
-  'guardarPlan', 'asignarPlan', 'ajustarCobro', 'registrarPago',
+  'guardarConfigFiscal', 'guardarCotizacion', 'convertirCotizacion', 'emitirFactura', 'pagarFactura', 'anularFactura',
 ]);
 
 /** Datos para la bitácora que hay que leer ANTES de la acción (p. ej. lo que se va a borrar). */
@@ -939,9 +1277,10 @@ async function contextoBitacora(db: SupabaseClient, accion: NombreAccion, e: Rec
     ctx.hotel_id = data?.hotel_id ?? null;
     ctx.etiqueta = data?.voucher_codigo ?? '';
   }
-  if (accion === 'asignarPlan' && esUuid(e.plan_id)) {
-    const { data } = await db.from('planes').select('nombre').eq('id', e.plan_id).maybeSingle();
-    ctx.etiqueta = data?.nombre ?? '';
+  if ((accion === 'pagarFactura' || accion === 'anularFactura') && esUuid(e.id)) {
+    const { data } = await db.from('facturas').select('numero, hotel_id').eq('id', e.id).maybeSingle();
+    ctx.hotel_id = data?.hotel_id ?? null;
+    ctx.etiqueta = data?.numero ?? '';
   }
   return ctx;
 }
@@ -978,16 +1317,18 @@ function resumenBitacora(accion: NombreAccion, e: Record<string, unknown>, salid
       return `Eliminó el tour «${etiqueta}»`;
     case 'estadoReserva':
       return `Reserva ${etiqueta} → ${ESTADOS_RESERVA_TEXTO[String(e.estado)] ?? e.estado}`;
-    case 'guardarPlan':
-      return e.id
-        ? `Editó el plan «${e.nombre}»${e.aplicar_a_actuales ? ` y actualizó la tarifa de ${s.actualizados ?? 0} hoteles` : ''}`
-        : `Creó el plan «${e.nombre}»`;
-    case 'ajustarCobro':
-      return `Cobro ajustado: ${e.habitaciones_contratadas} habitaciones contratadas${e.tarifa_habitacion !== null ? ` · tarifa ${e.tarifa_habitacion} por habitación` : ''}`;
-    case 'asignarPlan':
-      return e.plan_id ? `Asignó el plan «${etiqueta}»` : 'Quitó el plan del hotel';
-    case 'registrarPago':
-      return `Registró un pago de ${e.moneda === 'HNL' ? 'L' : '$'}${Number(e.monto).toFixed(2)}${e.incluye_isv ? ' con ISV' : ''} (${e.meses} ${Number(e.meses) === 1 ? 'mes' : 'meses'}, ${e.metodo}) · pagado hasta ${s.pagado_hasta ?? ''}`;
+    case 'guardarConfigFiscal':
+      return `Actualizó la configuración fiscal (CAI ${e.cai || 'sin CAI'})`;
+    case 'guardarCotizacion':
+      return e.id ? `Editó la cotización de ${e.cliente_nombre}` : `Creó una cotización para ${e.cliente_nombre} (${e.habitaciones} hab.)`;
+    case 'convertirCotizacion':
+      return `Convirtió una cotización en factura${s.hotel_id ? ' y dio de alta el hotel' : ''}`;
+    case 'emitirFactura':
+      return `Emitió la factura ${s.numero ?? ''} a ${e.cliente_nombre}`;
+    case 'pagarFactura':
+      return `Factura ${etiqueta} pagada (${e.metodo}${Number(e.retencion) > 0 ? `, retención L. ${Number(e.retencion).toFixed(2)}` : ''})`;
+    case 'anularFactura':
+      return `Anuló la factura ${etiqueta}: ${e.motivo}`;
     default:
       return accion;
   }

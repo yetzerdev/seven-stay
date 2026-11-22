@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import { useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import { ImagePlus, Loader2 } from 'lucide-react';
 
-import { formatoPrecio } from '@/components/portal/etiquetasTicket';
-import type { DatosHotelAdmin, Plan } from '@/lib/admin/tipos';
+import type { DatosHotelAdmin } from '@/lib/admin/tipos';
+import { categoriaPorHabitaciones, cotizarMensualidad, lempiras, PLANES_SAAS, type PlanSaas } from '@/lib/facturacion/tarifas';
 import { comprimirFoto } from '@/lib/imagenes';
 import type { ModoTours } from '@/types/sevenstay';
 
@@ -23,7 +23,8 @@ export const HOTEL_NUEVO: DatosHotelAdmin = {
   modo_tours: 'seven_stay',
   whatsapp_reception: '',
   rtn: '',
-  plan_id: null,
+  plan_saas: null,
+  gratis_hasta: '',
   habitaciones_contratadas: 0,
 };
 
@@ -62,18 +63,6 @@ export default function FormularioHotelAdmin({
   onCancelar?: () => void;
 }) {
   const { llamar } = useAdmin();
-  // Planes para elegir la tarifa desde el alta (sin pasar luego por Cobros).
-  const [planes, setPlanes] = useState<Plan[]>([]);
-  useEffect(() => {
-    let vivo = true;
-    llamar('planes', null).then(
-      (p) => vivo && setPlanes(p),
-      () => {},
-    );
-    return () => {
-      vivo = false;
-    };
-  }, [llamar]);
   const [d, setD] = useState<DatosHotelAdmin>(inicial);
   const [intentado, setIntentado] = useState(false);
   const [guardando, setGuardando] = useState(false);
@@ -201,21 +190,21 @@ export default function FormularioHotelAdmin({
         </Campo>
         <div className="grid grid-cols-[minmax(0,1fr)_150px] gap-3">
           <Campo
-            etiqueta="Plan"
-            ayuda={hotelId ? 'Cambiar de plan toma el precio actual del plan nuevo.' : 'Su precio queda congelado como tarifa del hotel.'}
+            etiqueta="Mensualidad SaaS"
+            ayuda={`${lempiras(cotizarMensualidad(d.plan_saas ?? categoriaPorHabitaciones(d.habitaciones_contratadas)).total)} / mes con ISV`}
           >
-            <select value={d.plan_id ?? ''} onChange={(e) => cambiar('plan_id', e.target.value || null)} className={INPUT}>
-              <option value="">Sin plan (no se cobra)</option>
-              {planes
-                .filter((p) => p.activo || p.id === d.plan_id)
-                .map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.nombre} · {formatoPrecio(p.precio_habitacion, p.moneda)} por hab.
-                  </option>
-                ))}
+            <select value={d.plan_saas ?? ''} onChange={(e) => cambiar('plan_saas', (e.target.value || null) as PlanSaas | null)} className={INPUT}>
+              <option value="">
+                Automática · {PLANES_SAAS[categoriaPorHabitaciones(d.habitaciones_contratadas)].nombre} (por habitaciones)
+              </option>
+              {(Object.keys(PLANES_SAAS) as PlanSaas[]).map((p) => (
+                <option key={p} value={p}>
+                  {PLANES_SAAS[p].nombre} ({PLANES_SAAS[p].rango}) · {lempiras(PLANES_SAAS[p].mensual)} + ISV
+                </option>
+              ))}
             </select>
           </Campo>
-          <Campo etiqueta="Hab. contratadas" ayuda="Mínimo que se cobra">
+          <Campo etiqueta="Hab. contratadas" ayuda="Define la categoría">
             <input
               inputMode="numeric"
               value={d.habitaciones_contratadas || ''}
@@ -225,6 +214,9 @@ export default function FormularioHotelAdmin({
             />
           </Campo>
         </div>
+        <Campo etiqueta="Mes gratis hasta (bonificación piloto)" ayuda="Vacío = sin periodo gratis. Mientras dure no se le cobra.">
+          <input type="date" value={d.gratis_hasta} onChange={(e) => cambiar('gratis_hasta', e.target.value)} className={INPUT} />
+        </Campo>
         <Campo etiqueta="Tours en el portal" ayuda="La gerencia también puede cambiarlo desde su panel.">
           <select value={d.modo_tours} onChange={(e) => cambiar('modo_tours', e.target.value as ModoTours)} className={INPUT}>
             {MODOS.map((m) => (

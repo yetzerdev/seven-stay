@@ -2,6 +2,7 @@
  * Tipos del panel interno de Seven Stay (/admin), compartidos entre el
  * navegador y el servidor (/api/admin).
  */
+import type { Concepto, LineaFactura, PlanSaas, TipoPlaca } from '@/lib/facturacion/tarifas';
 import type { Moneda, ModoTours } from '@/types/sevenstay';
 
 export type EstadoHotel = 'activo' | 'suspendido';
@@ -42,8 +43,10 @@ export interface DatosHotelAdmin {
   whatsapp_reception: string;
   /** RTN del hotel (para las facturas de Seven Stay en Honduras). */
   rtn: string;
-  /** Plan asignado (al asignarlo se congela su precio como tarifa del hotel). */
-  plan_id: string | null;
+  /** Categoría de la mensualidad SaaS; null = automática por habitaciones. */
+  plan_saas: PlanSaas | null;
+  /** Mes gratis (bonificación piloto) hasta esta fecha "AAAA-MM-DD"; '' = sin periodo gratis. */
+  gratis_hasta: string;
   /** Mínimo de habitaciones que se cobran aunque haya menos placas activas. */
   habitaciones_contratadas: number;
 }
@@ -159,73 +162,172 @@ export interface MetricasGlobales {
 }
 
 // ---------------------------------------------------------------------------
-// Etapa 3: cobro a hoteles y bitácora
+// Facturación SAR (todo en Lempiras)
 // ---------------------------------------------------------------------------
 
-export interface Plan {
-  id: string;
-  nombre: string;
-  descripcion: string;
-  /** Precio mensual por habitación con placa activa. */
-  precio_habitacion: number;
-  moneda: Moneda;
-  activo: boolean;
+export type { Concepto, LineaFactura, PlanSaas, TipoPlaca };
+
+/** Datos del emisor y control del CAI (una sola configuración). */
+export interface ConfigFiscal {
+  nombre_legal: string;
+  denominacion: string;
+  /** RTN del emisor, 14 caracteres. */
+  rtn: string;
+  domicilio: string;
+  telefono: string;
+  correo: string;
+  /** XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XX */
+  cai: string;
+  /** 000-001-01-00000001 */
+  rango_inicial: string;
+  rango_final: string;
+  fecha_limite: string | null;
+  registro_sag: string;
+  banco: string;
+  tipo_cuenta: string;
+  numero_cuenta: string;
+  titular: string;
 }
 
-export type MetodoPago = 'transferencia' | 'efectivo' | 'tarjeta' | 'otro';
-
-/** 'al_dia' · 'por_vencer' (≤ 7 días) · 'vencido' · 'sin_plan' */
-export type EstadoCobro = 'al_dia' | 'por_vencer' | 'vencido' | 'sin_plan';
-
-export interface CobroHotel {
-  id: string;
-  nombre: string;
-  estado_hotel: EstadoHotel;
-  plan_id: string | null;
-  habitaciones_activas: number;
-  habitaciones_contratadas: number;
-  /** Las que se cobran: el mayor entre contratadas y placas activas. */
-  habitaciones_cobradas: number;
-  /** Tarifa acordada por habitación (congelada al asignar el plan). */
-  tarifa_habitacion: number | null;
-  /** Tarifa × habitaciones cobradas (null si no tiene plan). */
-  mensualidad: number | null;
-  moneda: Moneda | null;
-  pagado_hasta: string | null;
-  estado_cobro: EstadoCobro;
-  /** Días de atraso (vencido) o que faltan para vencer (al día / por vencer). */
-  dias: number | null;
-  ultimo_pago: string | null;
+/** Cómo está el CAI ahora mismo (se calcula en el servidor). */
+export interface EstadoCai {
+  correlativo_actual: number | null;
+  /** Número que llevará la próxima factura (null si no se puede emitir). */
+  siguiente: string | null;
+  restantes: number | null;
+  dias_para_limite: number | null;
+  /** Motivo por el que no se puede emitir, o null si se puede. */
+  bloqueo: string | null;
 }
 
-export interface PagoHotel {
+export type EstadoCotizacion = 'borrador' | 'enviada' | 'aceptada' | 'convertida';
+
+export interface Cotizacion {
   id: string;
-  monto: number;
-  moneda: Moneda;
-  fecha_pago: string;
-  meses: number;
-  periodo_desde: string;
-  periodo_hasta: string;
-  metodo: MetodoPago;
-  referencia: string;
+  numero: string;
+  creado_at: string;
+  hotel_id: string | null;
+  cliente_nombre: string;
+  cliente_rtn: string;
+  ciudad: string;
+  contacto: string;
+  habitaciones: number;
+  tipo_placa: TipoPlaca | null;
+  plan_saas: PlanSaas | null;
+  bonificacion_piloto: boolean;
   notas: string;
-  registrado_por: string;
-  incluye_isv: boolean;
-  subtotal: number | null;
-  isv: number | null;
+  estado: EstadoCotizacion;
+  convertida_hotel_id: string | null;
 }
 
-export interface NuevoPago {
+export type DatosCotizacion = Omit<Cotizacion, 'id' | 'numero' | 'creado_at' | 'estado' | 'convertida_hotel_id'> & { id?: string };
+
+/** 'vencida' no se guarda: es una pendiente cuya fecha de vencimiento ya pasó. */
+export type EstadoFactura = 'pendiente' | 'pagada' | 'vencida' | 'anulada';
+export type MetodoPagoFactura = 'transferencia' | 'deposito' | 'cheque';
+
+export interface Emisor {
+  nombre_legal: string;
+  denominacion: string;
+  rtn: string;
+  domicilio: string;
+  telefono: string;
+  correo: string;
+  banco: string;
+  tipo_cuenta: string;
+  numero_cuenta: string;
+  titular: string;
+}
+
+export interface Factura {
+  id: string;
+  numero: string;
+  cai: string;
+  rango_inicial: string;
+  rango_final: string;
+  fecha_limite: string;
+  emisor: Emisor;
+  fecha_emision: string;
+  condicion: 'contado' | 'credito';
+  vence: string;
+  hotel_id: string | null;
+  cotizacion_id: string | null;
+  cliente_nombre: string;
+  cliente_rtn: string;
+  cliente_direccion: string;
+  lineas: LineaFactura[];
+  descuentos: number;
+  importe_exento: number;
+  importe_exonerado: number;
+  importe_gravado: number;
+  isv: number;
+  total: number;
+  total_letras: string;
+  orden_compra_exenta: string;
+  constancia_exonerado: string;
+  registro_sag: string;
+  mensualidad_meses: number | null;
+  estado: EstadoFactura;
+  pago_fecha: string | null;
+  pago_metodo: MetodoPagoFactura | null;
+  pago_referencia: string;
+  retencion: number;
+  retencion_comprobante: string;
+  anulada_motivo: string;
+  emitida_por: string;
+}
+
+/** Lo que llena la pantalla para emitir (el servidor recalcula totales, letras y número). */
+export interface NuevaFactura {
+  hotel_id: string | null;
+  cotizacion_id: string | null;
+  cliente_nombre: string;
+  cliente_rtn: string;
+  cliente_direccion: string;
+  condicion: 'contado' | 'credito';
+  vence: string;
+  lineas: { cantidad: number; descripcion: string; precio_unitario: number; concepto: Concepto }[];
+  orden_compra_exenta: string;
+  constancia_exonerado: string;
+  registro_sag: string;
+  mensualidad_meses: number | null;
+}
+
+export type EstadoSuscripcion = 'gratis' | 'al_dia' | 'por_vencer' | 'vencido';
+
+export interface Suscripcion {
   hotel_id: string;
-  monto: number;
-  moneda: Moneda;
-  fecha_pago: string;
-  meses: number;
-  metodo: MetodoPago;
-  referencia: string;
-  notas: string;
-  /** El monto incluye 15 % de ISV (factura SAR): se guarda el desglose. */
-  incluye_isv: boolean;
+  nombre: string;
+  cliente_rtn: string;
+  plan: PlanSaas;
+  plan_automatico: boolean;
+  habitaciones: number;
+  /** Mensualidad sin ISV y con ISV. */
+  subtotal: number;
+  total: number;
+  pagado_hasta: string | null;
+  gratis_hasta: string | null;
+  proximo_corte: string | null;
+  dias_mora: number;
+  estado: EstadoSuscripcion;
+  /** Factura de mensualidad emitida y aún sin pagar (para no duplicarla). */
+  factura_pendiente: string | null;
+}
+
+export interface ReporteFiscal {
+  desde: string;
+  hasta: string;
+  /** Facturado sin ISV (sin anuladas). */
+  facturado: number;
+  isv: number;
+  /** Cobrado en banco (total − retenciones de las pagadas en el rango). */
+  cobrado: number;
+  retenciones: number;
+  /** Pendiente de cobro (todas las no pagadas ni anuladas, de cualquier fecha). */
+  por_cobrar: number;
+  /** Mensualidades activas sin ISV (sin hoteles en periodo gratis). */
+  mrr: number;
+  facturas: Factura[];
 }
 
 export interface EntradaBitacora {
@@ -263,14 +365,25 @@ export interface AccionesAdmin {
   estadoReserva: { entrada: { id: string; estado: EstadoReserva }; salida: null };
   monitoreo: { entrada: null; salida: Monitoreo };
   metricasGlobales: { entrada: { dias: number }; salida: MetricasGlobales };
-  planes: { entrada: null; salida: Plan[] };
-  /** `aplicar_a_actuales`: si el precio cambió, también actualiza la tarifa de los hoteles con este plan. */
-  guardarPlan: { entrada: Omit<Plan, 'id'> & { id?: string; aplicar_a_actuales?: boolean }; salida: { id: string; actualizados: number } };
-  cobros: { entrada: null; salida: CobroHotel[] };
-  asignarPlan: { entrada: { hotel_id: string; plan_id: string | null }; salida: null };
-  ajustarCobro: { entrada: { hotel_id: string; habitaciones_contratadas: number; tarifa_habitacion: number | null }; salida: null };
-  registrarPago: { entrada: NuevoPago; salida: { pagado_hasta: string } };
-  pagosHotel: { entrada: { hotel_id: string }; salida: PagoHotel[] };
+  configFiscal: { entrada: null; salida: { config: ConfigFiscal; estado: EstadoCai } };
+  guardarConfigFiscal: { entrada: ConfigFiscal; salida: null };
+  cotizaciones: { entrada: null; salida: Cotizacion[] };
+  cotizacion: { entrada: { id: string }; salida: { cotizacion: Cotizacion; emisor: ConfigFiscal } };
+  guardarCotizacion: { entrada: DatosCotizacion; salida: { id: string } };
+  /** Pasa la cotización a borrador de factura de anticipo; opcionalmente da de alta el hotel. */
+  convertirCotizacion: { entrada: { id: string; dar_alta: boolean }; salida: { hotel_id: string | null; borrador: NuevaFactura } };
+  facturas: { entrada: { desde?: string; hasta?: string }; salida: Factura[] };
+  factura: { entrada: { id: string }; salida: Factura };
+  emitirFactura: { entrada: NuevaFactura; salida: { id: string; numero: string } };
+  pagarFactura: {
+    entrada: { id: string; fecha: string; metodo: MetodoPagoFactura; referencia: string; retencion: number; retencion_comprobante: string };
+    salida: { pagado_hasta: string | null };
+  };
+  anularFactura: { entrada: { id: string; motivo: string }; salida: null };
+  suscripciones: { entrada: null; salida: Suscripcion[] };
+  /** Borrador de la factura del mes de un hotel (mensualidad de su plan). */
+  borradorMensualidad: { entrada: { hotel_id: string }; salida: NuevaFactura };
+  reporteFiscal: { entrada: { desde: string; hasta: string }; salida: ReporteFiscal };
   bitacora: { entrada: { hotel_id?: string }; salida: EntradaBitacora[] };
 }
 

@@ -19,6 +19,7 @@ Pasos para dejar la base de datos lista (una sola vez por proyecto):
   13. `migrations/20261124000000_cobros_y_bitacora.sql` (planes por habitación, pagos de hoteles y bitácora del panel interno)
   14. `migrations/20261124000100_ajustes_negocio.sql` (comisión y operador de tours, RTN, tarifa congelada, mínimo de habitaciones, ISV y roles del panel interno)
   15. `migrations/20261125000000_realtime_tablas.sql` (habilita en Realtime todas las tablas que la app escucha en vivo)
+  16. `migrations/20261126000000_facturacion_sar.sql` (Facturación SAR: configuración fiscal y CAI, cotizaciones, facturas con correlativo y suscripciones en Lempiras)
 3. **Hotel piloto:** ejecutar `seed.sql`: 1 hotel, 10 habitaciones con códigos de placa aleatorios (la lista está al inicio del archivo) y 3 tours de prueba.
 4. **Huéspedes sin registro:** *Authentication → Sign In / Providers → Anonymous sign-ins* → **activar**.
    Sin esto el portal muestra "El portal no está disponible".
