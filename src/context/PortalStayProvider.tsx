@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import { BUCKET_FOTOS, blobDeDataUrl } from '@/lib/fotos';
+import { escucharEnVivo } from '@/lib/enVivo';
 import { aCategoria, aHabitacionPortal, aHotel, aPlato, aTicket, aTour, HOTEL_VACIO } from '@/lib/mapeos';
 import { clientePortal, supabaseConfigurado } from '@/lib/supabase';
 import { obtenerTokenCaptcha } from '@/lib/turnstile';
@@ -154,21 +155,16 @@ export function PortalStayProvider({ codigo, children }: { codigo: string; child
       clearTimeout(pendiente);
       pendiente = setTimeout(() => void cargarTickets().catch(() => {}), 150);
     };
-    const canal = cliente
-      .channel(`portal-${codigo}-${Math.random().toString(36).slice(2, 8)}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'tickets' }, refrescarTickets)
-      .subscribe();
     const refrescarTodo = () => {
       void cargarPortal().catch(() => {});
       refrescarTickets();
     };
-    const intervalo = setInterval(refrescarTodo, 60_000);
-    window.addEventListener('focus', refrescarTodo);
+    // RLS: el huésped solo recibe los cambios de SUS solicitudes. Al volver a la PWA
+    // (el teléfono corta la conexión en segundo plano) y cada 20 s se relee todo.
+    const dejar = escucharEnVivo(cliente, `portal-${codigo}`, [{ tabla: 'tickets' }], refrescarTickets, refrescarTodo);
     return () => {
       clearTimeout(pendiente);
-      clearInterval(intervalo);
-      window.removeEventListener('focus', refrescarTodo);
-      void cliente.removeChannel(canal);
+      dejar();
     };
   }, [estadoCarga, cliente, codigo, cargarPortal, cargarTickets]);
 

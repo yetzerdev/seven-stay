@@ -276,6 +276,29 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
     return { id: data!.id };
   },
 
+  eliminarHotel: async ({ id, confirmacion }, { db }) => {
+    if (!esUuid(id)) throw new ErrorAdmin('Hotel inválido.');
+    const { data: hotel, error } = await db.from('hotels').select('nombre').eq('id', id).maybeSingle();
+    revisar(error);
+    if (!hotel) throw new ErrorAdmin('Ese hotel ya no existe.');
+    if (String(confirmacion ?? '').trim() !== hotel.nombre.trim()) {
+      throw new ErrorAdmin('Para eliminarlo escribe el nombre del hotel exactamente igual.');
+    }
+    // Los usuarios del panel de este hotel se borran también: sin hotel no tienen a qué entrar.
+    const { data: staff, error: errorStaff } = await db.from('hotel_staff').select('user_id').eq('hotel_id', id).not('user_id', 'is', null);
+    revisar(errorStaff);
+    // Borrar el hotel borra en cascada habitaciones, solicitudes, personal, menú, tours propios,
+    // reservas, pagos y suscripciones de avisos.
+    revisar((await db.from('hotels').delete().eq('id', id)).error);
+    let usuarios_borrados = 0;
+    for (const s of staff ?? []) {
+      const { error: errorUsuario } = await db.auth.admin.deleteUser(s.user_id);
+      if (!errorUsuario) usuarios_borrados++;
+      else console.error('[api/admin] no se pudo borrar el usuario', s.user_id, errorUsuario.message);
+    }
+    return { usuarios_borrados };
+  },
+
   estadoHotel: async ({ id, estado }, { db }) => {
     if (!esUuid(id) || !['activo', 'suspendido'].includes(estado)) throw new ErrorAdmin('Solicitud inválida.');
     revisar((await db.from('hotels').update({ estado }).eq('id', id)).error);
@@ -882,7 +905,7 @@ const ESTADOS_RESERVA_TEXTO: Record<string, string> = { pendiente_pago: 'Pendien
 
 /** Acciones que cambian algo (las de solo lectura no se registran; subir imágenes tampoco). */
 const ACCIONES_REGISTRADAS = new Set<NombreAccion>([
-  'guardarHotel', 'estadoHotel', 'crearHabitaciones', 'editarHabitacion', 'reemplazarPlaca', 'eliminarHabitacion',
+  'guardarHotel', 'estadoHotel', 'eliminarHotel', 'crearHabitaciones', 'editarHabitacion', 'reemplazarPlaca', 'eliminarHabitacion',
   'invitarUsuario', 'enlaceAcceso', 'cambiarRol', 'quitarUsuario', 'guardarTour', 'eliminarTour', 'estadoReserva',
   'guardarPlan', 'asignarPlan', 'ajustarCobro', 'registrarPago',
 ]);
@@ -892,6 +915,11 @@ async function contextoBitacora(db: SupabaseClient, accion: NombreAccion, e: Rec
   const ctx: { hotel_id: string | null; etiqueta: string } = { hotel_id: null, etiqueta: '' };
   if (typeof e.hotel_id === 'string' && esUuid(e.hotel_id)) ctx.hotel_id = e.hotel_id;
   if ((accion === 'guardarHotel' || accion === 'estadoHotel') && esUuid(e.id)) ctx.hotel_id = e.id;
+  // El hotel eliminado ya no existe: la bitácora guarda su nombre en el texto, sin enlace.
+  if (accion === 'eliminarHotel' && esUuid(e.id)) {
+    const { data } = await db.from('hotels').select('nombre').eq('id', e.id).maybeSingle();
+    ctx.etiqueta = data?.nombre ?? '';
+  }
   if (['editarHabitacion', 'reemplazarPlaca', 'eliminarHabitacion'].includes(accion) && esUuid(e.id)) {
     const { data } = await db.from('rooms').select('hotel_id, numero').eq('id', e.id).maybeSingle();
     ctx.hotel_id = data?.hotel_id ?? null;
@@ -924,6 +952,8 @@ function resumenBitacora(accion: NombreAccion, e: Record<string, unknown>, salid
   switch (accion) {
     case 'guardarHotel':
       return e.id ? `Editó los datos del hotel ${datos.nombre ?? ''}`.trim() : `Creó el hotel ${datos.nombre ?? ''}`.trim();
+    case 'eliminarHotel':
+      return `Eliminó el hotel «${etiqueta}» con todos sus datos (${s.usuarios_borrados ?? 0} usuarios del panel borrados)`;
     case 'estadoHotel':
       return e.estado === 'suspendido' ? 'Suspendió el hotel' : 'Reactivó el hotel';
     case 'crearHabitaciones':

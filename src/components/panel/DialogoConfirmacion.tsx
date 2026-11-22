@@ -13,7 +13,7 @@ export interface OpcionesConfirmacion {
   /** "peligro" pinta el botón en rojo (acciones que cierran o rechazan algo). */
   tono?: 'normal' | 'peligro';
   /** Pide un motivo (texto libre) antes de confirmar. */
-  motivo?: { etiqueta: string; placeholder?: string; obligatorio?: boolean };
+  motivo?: { etiqueta: string; placeholder?: string; obligatorio?: boolean; debeCoincidir?: string };
 }
 
 /**
@@ -47,7 +47,9 @@ function Dialogo({ opciones, onResponder }: { opciones: OpcionesConfirmacion; on
   const botonConfirmar = useRef<HTMLButtonElement>(null);
   const campoMotivo = useRef<HTMLTextAreaElement>(null);
   const peligro = opciones.tono === 'peligro';
-  const faltaMotivo = Boolean(opciones.motivo?.obligatorio) && motivo.trim() === '';
+  const faltaMotivo =
+    (Boolean(opciones.motivo?.obligatorio) && motivo.trim() === '') ||
+    (opciones.motivo?.debeCoincidir !== undefined && motivo.trim() !== opciones.motivo.debeCoincidir.trim());
 
   useEffect(() => {
     (opciones.motivo ? campoMotivo.current : botonConfirmar.current)?.focus();

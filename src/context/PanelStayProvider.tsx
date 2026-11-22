@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import type { Session } from '@supabase/supabase-js';
 
 import { aCategoria, aHabitacion, aHotel, aPersonal, aPlato, aTicket, aTour, HOTEL_VACIO } from '@/lib/mapeos';
+import { escucharEnVivo } from '@/lib/enVivo';
 import { blobDeDataUrl } from '@/lib/fotos';
 import { clientePanel, supabaseConfigurado } from '@/lib/supabase';
 import { obtenerTokenCaptcha } from '@/lib/turnstile';
@@ -253,32 +254,47 @@ export function PanelStayProvider({ children }: { children: ReactNode }) {
   );
 
   // En vivo (Realtime): cada cambio en la base vuelve a leer esa parte.
+  // Un canal por tabla, con reconexión sola y respaldo cada 20 s (ver lib/enVivo).
   useEffect(() => {
     if (!cliente || !hotelIdListo) return;
-    const pendientes = new Map<string, ReturnType<typeof setTimeout>>();
-    const programar = (parte: 'tickets' | 'habitaciones' | 'hotel' | 'personal' | 'menu') => () => {
+    type Parte = 'tickets' | 'habitaciones' | 'hotel' | 'personal' | 'menu' | 'categorias';
+    const pendientes = new Map<Parte, ReturnType<typeof setTimeout>>();
+    const programar = (parte: Parte) => {
       clearTimeout(pendientes.get(parte));
       pendientes.set(parte, setTimeout(() => void refrescar(parte), 150));
     };
-    const filtro = `hotel_id=eq.${hotelIdListo}`;
-    const canal = cliente
-      .channel(`panel-${hotelIdListo}-${Math.random().toString(36).slice(2, 8)}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'tickets', filter: filtro }, programar('tickets'))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: filtro }, programar('habitaciones'))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'hotel_staff', filter: filtro }, programar('personal'))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'hotels', filter: `id=eq.${hotelIdListo}` }, programar('hotel'))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'curated_tours', filter: filtro }, programar('menu'))
-      .subscribe();
-    // Respaldo: si la conexión en vivo se cortó (laptop dormida), al volver se resincroniza.
-    const alVolver = () => {
-      void refrescar('tickets');
-      void refrescar('habitaciones');
+    const PARTE_DE: Record<string, Parte> = {
+      tickets: 'tickets',
+      rooms: 'habitaciones',
+      hotel_staff: 'personal',
+      hotels: 'hotel',
+      curated_tours: 'menu',
+      menu_items: 'menu',
+      menu_categorias: 'categorias',
     };
-    window.addEventListener('focus', alVolver);
+    const filtro = `hotel_id=eq.${hotelIdListo}`;
+    const dejar = escucharEnVivo(
+      cliente,
+      `panel-${hotelIdListo}`,
+      [
+        { tabla: 'tickets', filtro },
+        { tabla: 'rooms', filtro },
+        { tabla: 'hotel_staff', filtro },
+        { tabla: 'hotels', filtro: `id=eq.${hotelIdListo}` },
+        { tabla: 'curated_tours', filtro },
+        { tabla: 'menu_items', filtro },
+        { tabla: 'menu_categorias', filtro },
+      ],
+      (tabla) => programar(PARTE_DE[tabla] ?? 'tickets'),
+      // Al volver a la pestaña o cada 20 s: lo que más cambia (solicitudes y habitaciones).
+      () => {
+        programar('tickets');
+        programar('habitaciones');
+      },
+    );
     return () => {
       pendientes.forEach((t) => clearTimeout(t));
-      window.removeEventListener('focus', alVolver);
-      void cliente.removeChannel(canal);
+      dejar();
     };
   }, [cliente, hotelIdListo, refrescar]);
 

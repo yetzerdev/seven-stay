@@ -245,6 +245,8 @@ export interface AccionesAdmin {
   hotel: { entrada: { id: string }; salida: DetalleHotel };
   guardarHotel: { entrada: { id?: string; datos: DatosHotelAdmin }; salida: { id: string } };
   estadoHotel: { entrada: { id: string; estado: EstadoHotel }; salida: null };
+  /** Borra el hotel y TODO lo suyo. `confirmacion` debe ser su nombre exacto. */
+  eliminarHotel: { entrada: { id: string; confirmacion: string }; salida: { usuarios_borrados: number } };
   subirImagen: { entrada: { dataUrl: string; carpeta: string }; salida: { url: string } };
   crearHabitaciones: { entrada: { hotel_id: string; numeros: string[] }; salida: { creadas: number; repetidas: string[] } };
   editarHabitacion: { entrada: { id: string; numero?: string; estado_placa?: EstadoPlaca }; salida: null };

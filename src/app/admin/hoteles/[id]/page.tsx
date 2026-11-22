@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
-import { Building2, ChevronLeft, ExternalLink, Loader2, PauseCircle, PlayCircle } from 'lucide-react';
+import { Building2, ChevronLeft, ExternalLink, Loader2, PauseCircle, PlayCircle, Trash2 } from 'lucide-react';
 
 import FormularioHotelAdmin from '@/components/admin/FormularioHotelAdmin';
 import PestanaHabitaciones from '@/components/admin/PestanaHabitaciones';
@@ -49,6 +49,32 @@ export default function HotelAdminPage() {
   }, [llamar, id]);
 
   const irA = (p: Pestana) => router.replace(`/admin/hoteles/${id}?pestana=${p}`, { scroll: false });
+
+  const eliminar = async () => {
+    if (!detalle) return;
+    const nombre = detalle.hotel.nombre;
+    const escrito = await confirmar({
+      titulo: `¿Eliminar ${nombre} para siempre?`,
+      mensaje: (
+        <>
+          Se borran <strong>todas</strong> sus habitaciones y placas, solicitudes, menú, tours propios, reservas, pagos y los
+          accesos al panel de su personal. <strong>No se puede deshacer.</strong> Si solo quieres pausarlo, usa «Suspender».
+        </>
+      ),
+      textoConfirmar: 'Eliminar para siempre',
+      tono: 'peligro',
+      motivo: { etiqueta: `Escribe «${nombre}» para confirmar`, placeholder: nombre, obligatorio: true, debeCoincidir: nombre },
+    });
+    if (escrito === false) return;
+    setCambiandoEstado(true);
+    try {
+      await llamar('eliminarHotel', { id, confirmacion: escrito });
+      router.replace('/admin');
+    } catch (fallo) {
+      setError(fallo instanceof Error ? fallo.message : 'No se pudo eliminar el hotel.');
+      setCambiandoEstado(false);
+    }
+  };
 
   const alternarEstado = async () => {
     if (!detalle) return;
@@ -155,6 +181,16 @@ export default function HotelAdminPage() {
               <PlayCircle aria-hidden className="h-4 w-4" />
             )}
             {hotel.estado === 'activo' ? 'Suspender' : 'Reactivar hotel'}
+          </button>
+          <button
+            type="button"
+            disabled={cambiandoEstado}
+            onClick={() => void eliminar()}
+            title="Eliminar el hotel y todos sus datos"
+            className="flex h-11 items-center gap-2 rounded-xl px-4 text-[14.5px] font-semibold text-neutral-400 hover:bg-rose-50 hover:text-rose-600 disabled:opacity-50"
+          >
+            <Trash2 aria-hidden className="h-4 w-4" />
+            Eliminar
           </button>
         </div>
       </header>
