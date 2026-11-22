@@ -169,141 +169,140 @@ export function FacturaImpresa({ f }: { f: Factura }) {
 }
 
 // ---------------------------------------------------------------------------
-// Cotización (proforma comercial)
+// Cotización (proforma comercial) · diseño limpio: franja, una tabla, totales, firmas
 // ---------------------------------------------------------------------------
+
+/** Para que la franja oscura y el encabezado de la tabla salgan al imprimir. */
+const IMPRIMIR_FONDOS = { printColorAdjust: 'exact', WebkitPrintColorAdjust: 'exact' } as const;
 
 export function CotizacionImpresa({ c, emisor }: { c: Cotizacion; emisor: ConfigFiscal }) {
   const placas = c.tipo_placa ? cotizarPlacas(c.tipo_placa, c.habitaciones) : null;
   const saas = c.plan_saas ? cotizarMensualidad(c.plan_saas) : null;
+
+  const filas: { producto: string; detalle?: string; cantidad: string; precio: number; total: number }[] = [];
+  if (placas && c.tipo_placa) {
+    filas.push({
+      producto: `Placas NFC/QR · ${PLACAS[c.tipo_placa].nombre}`,
+      detalle: 'Pago único · instalación incluida',
+      cantidad: String(c.habitaciones),
+      precio: placas.unitario,
+      total: placas.subtotal,
+    });
+  }
+  if (saas && c.plan_saas) {
+    filas.push({
+      producto: `Plataforma Seven Stay · Plan ${PLANES_SAAS[c.plan_saas].nombre}`,
+      detalle: c.bonificacion_piloto ? 'Mensual · Mes 1 bonificado (L. 0.00)' : 'Mensual',
+      cantidad: '1 / mes',
+      precio: saas.subtotal,
+      total: saas.subtotal,
+    });
+  }
+
   return (
-    <article className="mx-auto w-full max-w-[816px] bg-white p-8 text-neutral-900 shadow-[0_8px_30px_-12px_rgba(17,24,39,0.25)] print:max-w-none print:p-0 print:shadow-none">
-      <style>{ESTILO_PAGINA}</style>
-      <Encabezado
-        emisor={emisor}
-        derecha={
-          <div className="w-[260px] rounded-lg border-2 border-neutral-900 p-3">
-            <p className="text-center text-[16px] font-black tracking-[0.14em]">COTIZACIÓN</p>
-            <p className="mb-2 text-center font-mono text-[14px] font-bold">{c.numero}</p>
-            <Dato etiqueta="Fecha" valor={fechaLarga(c.creado_at)} />
-            <Dato etiqueta="Válida por" valor="30 días" />
-            <Dato etiqueta="Moneda" valor="Lempiras (L.)" />
-          </div>
-        }
-      />
+    <article
+      style={IMPRIMIR_FONDOS}
+      className="mx-auto flex min-h-[1056px] w-full max-w-[816px] flex-col bg-white text-neutral-900 shadow-[0_8px_30px_-12px_rgba(17,24,39,0.25)] print:min-h-0 print:max-w-none print:shadow-none"
+    >
+      <style>{'@page { size: letter; margin: 0; }'}</style>
 
-      <section className="mt-4 grid grid-cols-2 gap-x-6 gap-y-1 rounded-lg border border-neutral-300 px-4 py-3 text-[12px]">
-        <p>
-          <span className="text-neutral-500">Hotel / Razón social: </span>
-          <strong>{c.cliente_nombre}</strong>
-        </p>
-        <p>
-          <span className="text-neutral-500">RTN: </span>
-          <strong>{c.cliente_rtn || '—'}</strong>
-        </p>
-        <p>
-          <span className="text-neutral-500">Contacto: </span>
-          {c.contacto || '—'}
-        </p>
-        <p>
-          <span className="text-neutral-500">Ciudad: </span>
-          {c.ciudad || '—'}
-        </p>
-        <p>
-          <span className="text-neutral-500">Habitaciones: </span>
-          <strong>{c.habitaciones}</strong>
-        </p>
-      </section>
+      {/* Franja superior */}
+      <header style={IMPRIMIR_FONDOS} className="flex items-start justify-between gap-8 bg-neutral-900 px-12 pb-9 pt-10 text-white">
+        <div>
+          <MarcaSevenStay tamano="lg" />
+          <p className="mt-3 text-[12px] font-semibold uppercase tracking-[0.18em] text-white/60">{emisor.denominacion || 'SevenCloud Systems'}</p>
+          {emisor.domicilio && <p className="mt-2 max-w-[260px] text-[11.5px] leading-relaxed text-white/70">{emisor.domicilio}</p>}
+        </div>
+        <div className="text-right">
+          <p className="text-[26px] font-black tracking-[0.06em]">COTIZACIÓN</p>
+          <p className="font-mono text-[13px] text-white/70">{c.numero}</p>
+          <dl className="mt-4 grid grid-cols-[auto_auto] gap-x-4 gap-y-1 text-left text-[12px]">
+            <dt className="text-white/55">Fecha</dt>
+            <dd className="font-semibold">{fechaLarga(c.creado_at)}</dd>
+            <dt className="text-white/55">Cliente</dt>
+            <dd className="max-w-[200px] font-semibold">{c.cliente_nombre}</dd>
+            {c.contacto && (
+              <>
+                <dt className="text-white/55">Contacto</dt>
+                <dd className="font-semibold">{c.contacto}</dd>
+              </>
+            )}
+          </dl>
+        </div>
+      </header>
 
-      {placas && c.tipo_placa && (
-        <section className="mt-5">
-          <h2 className="text-[13px] font-black uppercase tracking-[0.1em]">1. Placas NFC/QR · pago único</h2>
-          <table className="mt-2 w-full border-collapse text-[12px]">
-            <thead>
-              <tr className="bg-neutral-900 text-white">
-                <th className="px-3 py-2 text-left font-semibold">Descripción</th>
-                <th className="px-3 py-2 text-right font-semibold">Cant.</th>
-                <th className="px-3 py-2 text-right font-semibold">Precio (sin ISV)</th>
-                <th className="px-3 py-2 text-right font-semibold">Subtotal</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr className="border-b border-neutral-200">
-                <td className="px-3 py-2">
-                  {PLACAS[c.tipo_placa].nombre} · categoría {PLANES_SAAS[placas.categoria].nombre} ({PLANES_SAAS[placas.categoria].rango})
+      <div className="flex flex-1 flex-col px-12 py-9">
+        <p className="text-[13px] leading-relaxed text-neutral-600">
+          Portal del huésped y panel operativo Seven Stay para <strong className="text-neutral-900">{c.cliente_nombre}</strong>
+          {c.ciudad ? `, ${c.ciudad}` : ''} · {c.habitaciones} habitaciones.
+        </p>
+
+        <table className="mt-6 w-full border-collapse text-[12.5px]">
+          <thead>
+            <tr style={IMPRIMIR_FONDOS} className="bg-neutral-900 text-white">
+              <th className="px-4 py-2.5 text-left font-semibold">Producto</th>
+              <th className="px-4 py-2.5 text-right font-semibold">Cantidad</th>
+              <th className="px-4 py-2.5 text-right font-semibold">Precio</th>
+              <th className="px-4 py-2.5 text-right font-semibold">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filas.map((f) => (
+              <tr key={f.producto} className="border-b border-neutral-200 align-top">
+                <td className="px-4 py-3">
+                  <p className="font-semibold">{f.producto}</p>
+                  {f.detalle && <p className="text-[11.5px] text-neutral-500">{f.detalle}</p>}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums">{c.habitaciones}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{lempiras(placas.unitario)}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{lempiras(placas.subtotal)}</td>
+                <td className="px-4 py-3 text-right tabular-nums">{f.cantidad}</td>
+                <td className="px-4 py-3 text-right tabular-nums">{lempiras(f.precio)}</td>
+                <td className="px-4 py-3 text-right font-semibold tabular-nums">{lempiras(f.total)}</td>
               </tr>
-            </tbody>
-          </table>
-          <div className="mt-2 grid grid-cols-[1fr_300px] gap-6">
-            <div className="rounded-lg bg-neutral-100 px-3 py-2 text-[11.5px] leading-relaxed">
-              <p className="font-bold">Condiciones de pago</p>
-              <p>50% Anticipo contra firma: <strong className="tabular-nums">{lempiras(placas.anticipo)}</strong></p>
-              <p>50% Contra entrega e instalación: <strong className="tabular-nums">{lempiras(placas.saldo)}</strong></p>
-            </div>
-            <div className="rounded-lg border-2 border-neutral-900 text-[12px]">
-              <div className="flex justify-between border-b border-neutral-200 px-3 py-1.5">
-                <span>Subtotal</span>
+            ))}
+          </tbody>
+        </table>
+        <p className="mt-2 text-right text-[11px] text-neutral-500">Precios sin ISV · se agrega 15% ISV</p>
+
+        {/* Totales: el pago único y la mensualidad se muestran por separado */}
+        <div className="mt-5 ml-auto w-[320px] text-[13px]">
+          {placas && (
+            <>
+              <div className="flex justify-between py-1">
+                <span className="text-neutral-600">Placas · subtotal</span>
                 <span className="tabular-nums">{lempiras(placas.subtotal)}</span>
               </div>
-              <div className="flex justify-between border-b border-neutral-200 px-3 py-1.5">
-                <span>ISV (15%)</span>
+              <div className="flex justify-between py-1">
+                <span className="text-neutral-600">ISV 15%</span>
                 <span className="tabular-nums">{lempiras(placas.isv)}</span>
               </div>
-              <div className="flex justify-between bg-neutral-900 px-3 py-1.5 font-black text-white">
-                <span>Total placas</span>
+              <div style={IMPRIMIR_FONDOS} className="mt-1 flex justify-between bg-neutral-900 px-3 py-2 font-bold text-white">
+                <span>Total pago único</span>
                 <span className="tabular-nums">{lempiras(placas.total)}</span>
               </div>
+            </>
+          )}
+          {saas && (
+            <div className={`flex justify-between border-2 border-neutral-900 px-3 py-2 font-bold ${placas ? 'mt-2' : ''}`}>
+              <span>Mensualidad con ISV</span>
+              <span className="tabular-nums">{lempiras(saas.total)} / mes</span>
             </div>
-          </div>
-        </section>
-      )}
+          )}
+        </div>
 
-      {saas && c.plan_saas && (
-        <section className="mt-5">
-          <h2 className="text-[13px] font-black uppercase tracking-[0.1em]">{placas ? '2' : '1'}. Plataforma SaaS Seven Stay · mensual</h2>
-          <div className="mt-2 grid grid-cols-[1fr_300px] gap-6">
-            <div className="text-[12px] leading-relaxed">
-              <p>
-                <strong>Plan {PLANES_SAAS[c.plan_saas].nombre}</strong> ({PLANES_SAAS[c.plan_saas].rango})
-              </p>
-              <p className="text-neutral-600">Portal del huésped bilingüe, panel del hotel, avisos en vivo, métricas y soporte.</p>
-              {c.bonificacion_piloto && (
-                <p className="mt-1 rounded-md bg-emerald-50 px-2 py-1 font-semibold text-emerald-800">Bonificación Piloto: Mes 1 SaaS L. 0.00</p>
-              )}
-            </div>
-            <div className="rounded-lg border-2 border-neutral-900 text-[12px]">
-              <div className="flex justify-between border-b border-neutral-200 px-3 py-1.5">
-                <span>Mensualidad</span>
-                <span className="tabular-nums">{lempiras(saas.subtotal)}</span>
-              </div>
-              <div className="flex justify-between border-b border-neutral-200 px-3 py-1.5">
-                <span>ISV (15%)</span>
-                <span className="tabular-nums">{lempiras(saas.isv)}</span>
-              </div>
-              <div className="flex justify-between bg-neutral-900 px-3 py-1.5 font-black text-white">
-                <span>Total / mes</span>
-                <span className="tabular-nums">{lempiras(saas.total)}</span>
-              </div>
-            </div>
-          </div>
-        </section>
-      )}
+        {placas && (
+          <p className="mt-5 text-[12px] text-neutral-600">
+            Forma de pago de las placas: 50% de anticipo al firmar ({lempiras(placas.anticipo)}) y 50% contra entrega e instalación ({lempiras(placas.saldo)}).
+          </p>
+        )}
+        {c.notas && <p className="mt-2 text-[12px] text-neutral-600">{c.notas}</p>}
 
-      {c.notas && <p className="mt-5 rounded-lg border border-neutral-300 px-3 py-2 text-[11.5px] text-neutral-700">Notas: {c.notas}</p>}
+        <p className="mt-6 text-[12px] font-bold">Cotización válida por 30 días.</p>
 
-      <div className="mt-5">
-        <DatosBancarios e={emisor} />
+        {/* Firmas al pie de la hoja */}
+        <div className="mt-auto grid grid-cols-2 gap-16 pt-20 text-[11.5px] text-neutral-600">
+          <p className="border-t border-neutral-400 pt-2">Firma del cliente</p>
+          <p className="border-t border-neutral-400 pt-2">{emisor.denominacion || 'SevenCloud Systems'}</p>
+        </div>
       </div>
-
-      <footer className="mt-6 flex items-center justify-between border-t border-neutral-300 pt-3 text-[10.5px] text-neutral-500">
-        <span>Documento informativo · no es una factura. Precios en Lempiras; incluyen 15% ISV donde se indica.</span>
-        <span className="flex items-center gap-2">
-          <MarcaSevenStay tamano="sm" className="text-neutral-700" />
-        </span>
-      </footer>
     </article>
   );
 }
