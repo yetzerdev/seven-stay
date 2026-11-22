@@ -47,6 +47,10 @@ export interface DatosHotelAdmin {
   plan_saas: PlanSaas | null;
   /** Mes gratis (bonificación piloto) hasta esta fecha "AAAA-MM-DD"; '' = sin periodo gratis. */
   gratis_hasta: string;
+  /** Dirección que sale en sus facturas. */
+  direccion_fiscal: string;
+  /** Placa que usa el hotel (para cobrar anticipo, saldo y reposiciones). */
+  tipo_placa: TipoPlaca | null;
   /** Mínimo de habitaciones que se cobran aunque haya menos placas activas. */
   habitaciones_contratadas: number;
 }
@@ -286,11 +290,28 @@ export interface NuevaFactura {
   cliente_direccion: string;
   condicion: 'contado' | 'credito';
   vence: string;
-  lineas: { cantidad: number; descripcion: string; precio_unitario: number; concepto: Concepto }[];
+  /** total_con_isv = precio cerrado (el ISV de esa línea es la diferencia con el subtotal). */
+  lineas: { cantidad: number; descripcion: string; precio_unitario: number; concepto: Concepto; total_con_isv?: number | null }[];
+  /** Descuentos y rebajas otorgados, en Lempiras (se restan antes del ISV). */
+  descuentos: number;
   orden_compra_exenta: string;
   constancia_exonerado: string;
   registro_sag: string;
   mensualidad_meses: number | null;
+}
+
+export interface DatosCobroHotel {
+  hotel_id: string;
+  cliente_nombre: string;
+  cliente_rtn: string;
+  cliente_direccion: string;
+  plan: PlanSaas;
+  habitaciones: number;
+  tipo_placa: TipoPlaca;
+  /** true si el hotel no tiene tipo de placa guardado (se usa Esencial). */
+  placa_supuesta: boolean;
+  /** "Diciembre 2026": mes que cubriría la próxima mensualidad. */
+  mes_mensualidad: string;
 }
 
 export type EstadoSuscripcion = 'gratis' | 'al_dia' | 'por_vencer' | 'vencido';
@@ -384,6 +405,8 @@ export interface AccionesAdmin {
   /** Borrador de la factura del mes de un hotel (mensualidad de su plan). */
   borradorMensualidad: { entrada: { hotel_id: string }; salida: NuevaFactura };
   reporteFiscal: { entrada: { desde: string; hasta: string }; salida: ReporteFiscal };
+  /** Lo que la factura necesita del hotel para cobrar en 1 clic. */
+  datosCobroHotel: { entrada: { hotel_id: string }; salida: DatosCobroHotel };
   bitacora: { entrada: { hotel_id?: string }; salida: EntradaBitacora[] };
 }
 

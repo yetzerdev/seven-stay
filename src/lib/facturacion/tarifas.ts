@@ -35,16 +35,28 @@ export const PLANES_SAAS: Record<PlanSaas, { nombre: string; rango: string; mens
 };
 
 /** Precio por placa SIN ISV, según el tamaño del hotel (pago único). */
-export const PLACAS: Record<TipoPlaca, { nombre: string; precio: Record<PlanSaas, number> }> = {
-  esencial: { nombre: 'Línea Esencial (Acrílico en «L»)', precio: { boutique: 652.17, estandar: 600, resort: 565.22 } },
-  ejecutiva: { nombre: 'Línea Ejecutiva (Madera + Acrílico)', precio: { boutique: 773.91, estandar: 713.04, resort: 660.87 } },
+/**
+ * Precio FINAL por placa CON ISV (pago único), según el tamaño del hotel.
+ * Regla: siempre se parte del total final cerrado y de ahí se saca el subtotal
+ * (÷ 1.15), para que el total a pagar nunca gane ni pierda centavos.
+ */
+export const PLACAS: Record<TipoPlaca, { nombre: string; final: Record<PlanSaas, number> }> = {
+  esencial: { nombre: 'Línea Esencial (Acrílico en «L»)', final: { boutique: 750, estandar: 690, resort: 650 } },
+  ejecutiva: { nombre: 'Línea Ejecutiva (Madera + Acrílico)', final: { boutique: 890, estandar: 820, resort: 760 } },
 };
 
-/** Reposición de una placa individual, SIN ISV. */
-export const REPOSICION: Record<TipoPlaca, { nombre: string; precio: number }> = {
-  esencial: { nombre: 'Reposición de placa individual — Acrílico', precio: 600 },
-  ejecutiva: { nombre: 'Reposición de placa individual — Madera', precio: 713.04 },
+/** Reposición de una placa individual, precio FINAL con ISV. */
+export const REPOSICION: Record<TipoPlaca, { nombre: string; final: number }> = {
+  esencial: { nombre: 'Reposición de placa individual — Acrílico', final: 690 },
+  ejecutiva: { nombre: 'Reposición de placa individual — Madera', final: 820 },
 };
+
+/**
+ * Subtotal (sin ISV) de un total final cerrado: total ÷ 1.15.
+ * Ej. L. 3,750.00 → L. 3,260.87. El ISV de ese precio cerrado es la diferencia
+ * (L. 489.13), así el total nunca gana ni pierde centavos.
+ */
+export const gravadoPara = (totalConIsv: number) => r2(r2(totalConIsv) / (1 + ISV));
 
 export const conIsv = (sinIsv: number) => r2(sinIsv * (1 + ISV));
 
@@ -71,30 +83,66 @@ export interface LineaFactura {
   /** cantidad × precio_unitario (sin ISV). */
   total: number;
   concepto: Concepto;
+  /**
+   * Precio cerrado: total FINAL con ISV de la línea (placas, anticipo, saldo,
+   * reposición). Si existe, el ISV de la línea es total_con_isv − total.
+   */
+  total_con_isv?: number | null;
 }
 
-/** Todo lo de Seven Stay es gravado con 15 %: exento y exonerado en cero. */
-export function totalesSar(lineas: Pick<LineaFactura, 'cantidad' | 'precio_unitario'>[]) {
-  const gravado = r2(lineas.reduce((s, l) => s + r2(l.cantidad * l.precio_unitario), 0));
-  const isv = r2(gravado * ISV);
-  return { descuentos: 0, importe_exento: 0, importe_exonerado: 0, importe_gravado: gravado, isv, total: r2(gravado + isv) };
+/**
+ * Totales SAR. Todo lo de Seven Stay es gravado con 15 % (exento y exonerado en
+ * cero). Los descuentos se restan antes del ISV.
+ */
+export function totalesSar(lineas: Pick<LineaFactura, 'cantidad' | 'precio_unitario' | 'total_con_isv'>[], descuento = 0) {
+  const sinIsv = (l: Pick<LineaFactura, 'cantidad' | 'precio_unitario'>) => r2(l.cantidad * l.precio_unitario);
+  const bruto = r2(lineas.reduce((s, l) => s + sinIsv(l), 0));
+  const descuentos = r2(Math.min(Math.max(0, descuento || 0), bruto));
+  // Con descuento todo se calcula a la forma normal (15 % sobre lo gravado).
+  const cerradas = descuentos ? [] : lineas.filter((l) => l.total_con_isv != null && l.total_con_isv > 0);
+  const abiertas = lineas.filter((l) => !cerradas.includes(l));
+  const gravadoAbierto = r2(abiertas.reduce((s, l) => s + sinIsv(l), 0) - descuentos);
+  const gravadoCerrado = r2(cerradas.reduce((s, l) => s + sinIsv(l), 0));
+  const totalCerrado = r2(cerradas.reduce((s, l) => s + (l.total_con_isv ?? 0), 0));
+  // Precio cerrado: ISV = total final − subtotal. Precio abierto: 15 % del subtotal.
+  const isv = r2(r2(gravadoAbierto * ISV) + r2(totalCerrado - gravadoCerrado));
+  const gravado = r2(gravadoAbierto + gravadoCerrado);
+  return { descuentos, importe_exento: 0, importe_exonerado: 0, importe_gravado: gravado, isv, total: r2(gravado + isv) };
 }
 
-/** Placas de una cotización: total sin ISV, ISV y total, más el 50/50. */
+/** Placas: total final cerrado, 50/50 cerrado, y de ahí los subtotales sin ISV. */
 export function cotizarPlacas(tipo: TipoPlaca, habitaciones: number) {
   const categoria = categoriaPorHabitaciones(habitaciones);
-  const unitario = PLACAS[tipo].precio[categoria];
-  const subtotal = r2(unitario * habitaciones);
-  const isv = r2(subtotal * ISV);
-  const total = r2(subtotal + isv);
+  const unitarioConIsv = PLACAS[tipo].final[categoria];
+  const total = r2(unitarioConIsv * habitaciones);
+  const subtotal = gravadoPara(total);
   const anticipo = r2(total / 2);
-  return { categoria, unitario, unitarioConIsv: conIsv(unitario), subtotal, isv, total, anticipo, saldo: r2(total - anticipo) };
+  const saldo = r2(total - anticipo);
+  return {
+    categoria,
+    /** Solo para mostrar: precio unitario sin ISV. */
+    unitario: r2(unitarioConIsv / (1 + ISV)),
+    unitarioConIsv,
+    subtotal,
+    isv: r2(total - subtotal),
+    total,
+    anticipo,
+    saldo,
+    anticipoSinIsv: gravadoPara(anticipo),
+    saldoSinIsv: gravadoPara(saldo),
+  };
 }
 
 export function cotizarMensualidad(plan: PlanSaas) {
   const subtotal = PLANES_SAAS[plan].mensual;
   const isv = r2(subtotal * ISV);
   return { subtotal, isv, total: r2(subtotal + isv) };
+}
+
+/** Reposición de N placas: total final cerrado y su subtotal sin ISV. */
+export function cotizarReposicion(tipo: TipoPlaca, cantidad: number) {
+  const total = r2(REPOSICION[tipo].final * cantidad);
+  return { total, subtotal: gravadoPara(total) };
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ import { useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import { ImagePlus, Loader2 } from 'lucide-react';
 
 import type { DatosHotelAdmin } from '@/lib/admin/tipos';
-import { categoriaPorHabitaciones, cotizarMensualidad, lempiras, PLANES_SAAS, type PlanSaas } from '@/lib/facturacion/tarifas';
+import { categoriaPorHabitaciones, cotizarMensualidad, lempiras, PLACAS, PLANES_SAAS, type PlanSaas, type TipoPlaca } from '@/lib/facturacion/tarifas';
 import { comprimirFoto } from '@/lib/imagenes';
 import type { ModoTours } from '@/types/sevenstay';
 
@@ -25,6 +25,8 @@ export const HOTEL_NUEVO: DatosHotelAdmin = {
   rtn: '',
   plan_saas: null,
   gratis_hasta: '',
+  direccion_fiscal: '',
+  tipo_placa: null,
   habitaciones_contratadas: 0,
 };
 
@@ -214,6 +216,19 @@ export default function FormularioHotelAdmin({
             />
           </Campo>
         </div>
+        <Campo etiqueta="Dirección fiscal" ayuda="La que sale en sus facturas.">
+          <input value={d.direccion_fiscal} maxLength={300} onChange={(e) => cambiar('direccion_fiscal', e.target.value)} className={INPUT} />
+        </Campo>
+        <Campo etiqueta="Tipo de placa" ayuda="Para cobrar anticipo, saldo y reposiciones.">
+          <select value={d.tipo_placa ?? ''} onChange={(e) => cambiar('tipo_placa', (e.target.value || null) as TipoPlaca | null)} className={INPUT}>
+            <option value="">Sin definir</option>
+            {(Object.keys(PLACAS) as TipoPlaca[]).map((t) => (
+              <option key={t} value={t}>
+                {PLACAS[t].nombre}
+              </option>
+            ))}
+          </select>
+        </Campo>
         <Campo etiqueta="Mes gratis hasta (bonificación piloto)" ayuda="Vacío = sin periodo gratis. Mientras dure no se le cobra.">
           <input type="date" value={d.gratis_hasta} onChange={(e) => cambiar('gratis_hasta', e.target.value)} className={INPUT} />
         </Campo>

@@ -5,6 +5,7 @@ import {
   CONCEPTOS,
   cotizarMensualidad,
   cotizarPlacas,
+  gravadoPara,
   montoEnLetras,
   PLACAS,
   PLANES_SAAS,
@@ -144,6 +145,8 @@ function limpiarHotel(d: DatosHotelAdmin): DatosHotelAdmin {
     rtn: String(d.rtn ?? '').replace(/[^\d-]/g, '').slice(0, 20),
     plan_saas: PLANES.includes(d.plan_saas as PlanSaas) ? d.plan_saas : null,
     gratis_hasta: esFecha(d.gratis_hasta) ? d.gratis_hasta : '',
+    direccion_fiscal: String(d.direccion_fiscal ?? '').trim().slice(0, 300),
+    tipo_placa: d.tipo_placa === 'esencial' || d.tipo_placa === 'ejecutiva' ? d.tipo_placa : null,
     habitaciones_contratadas: Math.min(5000, Math.max(0, Math.trunc(Number(d.habitaciones_contratadas) || 0))),
   };
 }
@@ -425,6 +428,8 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
         rtn: h.rtn ?? '',
         plan_saas: h.plan_saas ?? null,
         gratis_hasta: h.gratis_hasta ?? '',
+        direccion_fiscal: h.direccion_fiscal ?? '',
+        tipo_placa: h.tipo_placa ?? null,
         habitaciones_contratadas: h.habitaciones_contratadas ?? 0,
       },
       habitaciones: (rooms.data ?? [])
@@ -977,6 +982,8 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
           plan_saas: c.plan_saas && c.plan_saas !== categoriaPorHabitaciones(c.habitaciones) ? c.plan_saas : null,
           gratis_hasta: gratis,
           moneda_default: 'HNL',
+          tipo_placa: c.tipo_placa,
+          direccion_fiscal: c.ciudad,
         })
         .select('id')
         .single();
@@ -992,9 +999,10 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
       const p = cotizarPlacas(c.tipo_placa, c.habitaciones);
       lineas.push({
         cantidad: 1,
-        descripcion: `${CONCEPTOS.anticipo_placas} — ${PLACAS[c.tipo_placa].nombre}: ${c.habitaciones} placas × L. ${p.unitario.toFixed(2)}`,
-        precio_unitario: r2(p.subtotal / 2),
+        descripcion: `${CONCEPTOS.anticipo_placas} — ${PLACAS[c.tipo_placa].nombre}: ${c.habitaciones} placas × L. ${p.unitarioConIsv.toFixed(2)} ISV incluido`,
+        precio_unitario: p.anticipoSinIsv,
         concepto: 'anticipo_placas',
+        total_con_isv: p.anticipo,
       });
     } else if (c.plan_saas) {
       lineas.push({
@@ -1018,6 +1026,7 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
         orden_compra_exenta: '',
         constancia_exonerado: '',
         registro_sag: '',
+        descuentos: 0,
         mensualidad_meses: lineas[0]?.concepto === 'mensualidad' ? 1 : null,
       },
     };
@@ -1055,15 +1064,23 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
       if (!descripcion) throw new ErrorAdmin('Cada línea necesita una descripción.');
       if (!(cantidad > 0 && cantidad <= 100000)) throw new ErrorAdmin('Cantidad inválida en una línea.');
       if (!Number.isFinite(precio) || precio < 0) throw new ErrorAdmin('Precio inválido en una línea.');
+      // Precio cerrado: el subtotal debe corresponder a su total final ÷ 1.15.
+      const cerrado = l.total_con_isv != null && Number(l.total_con_isv) > 0 ? r2(Number(l.total_con_isv)) : null;
+      if (cerrado !== null && Math.abs(gravadoPara(cerrado) - r2(cantidad * precio)) > 0.02) {
+        throw new ErrorAdmin('Una línea con precio cerrado no cuadra con su total final.');
+      }
       return {
         cantidad,
         descripcion,
         precio_unitario: precio,
         total: r2(cantidad * precio),
         concepto: CONCEPTOS_VALIDOS.includes(l.concepto) ? l.concepto : 'libre',
+        total_con_isv: cerrado,
       };
     });
-    const totales = totalesSar(lineas);
+    const descuento = r2(Number(f.descuentos) || 0);
+    if (descuento < 0) throw new ErrorAdmin('El descuento no puede ser negativo.');
+    const totales = totalesSar(lineas, descuento);
     if (totales.total <= 0) throw new ErrorAdmin('El total de la factura debe ser mayor que cero.');
     const meses = f.mensualidad_meses ? Math.trunc(Number(f.mensualidad_meses)) : null;
     const { data, error } = await db.rpc('emitir_factura', {
@@ -1177,7 +1194,32 @@ const ACCIONES: { [N in NombreAccion]: Manejador<N> } = {
       orden_compra_exenta: '',
       constancia_exonerado: '',
       registro_sag: '',
+      descuentos: 0,
       mensualidad_meses: 1,
+    };
+  },
+
+  datosCobroHotel: async ({ hotel_id }, { db }) => {
+    if (!esUuid(hotel_id)) throw new ErrorAdmin('Hotel inválido.');
+    const [hotel, rooms] = await Promise.all([
+      db.from('hotels').select('id, nombre, rtn, direccion_fiscal, tipo_placa, plan_saas, habitaciones_contratadas, pagado_hasta, gratis_hasta').eq('id', hotel_id).maybeSingle(),
+      db.from('rooms').select('id', { count: 'exact', head: true }).eq('hotel_id', hotel_id),
+    ]);
+    revisar(hotel.error);
+    revisar(rooms.error);
+    const h = exigir(hotel.data, 'Ese hotel no existe.');
+    const habitaciones = Math.max(h.habitaciones_contratadas ?? 0, rooms.count ?? 0);
+    const inicio = [h.pagado_hasta, h.gratis_hasta, hoyISO()].filter(Boolean).sort().at(-1)!;
+    return {
+      hotel_id: h.id,
+      cliente_nombre: h.nombre,
+      cliente_rtn: h.rtn ?? '',
+      cliente_direccion: h.direccion_fiscal ?? '',
+      plan: h.plan_saas ?? categoriaPorHabitaciones(habitaciones),
+      habitaciones,
+      tipo_placa: h.tipo_placa ?? 'esencial',
+      placa_supuesta: !h.tipo_placa,
+      mes_mensualidad: etiquetaMes(inicio),
     };
   },
 

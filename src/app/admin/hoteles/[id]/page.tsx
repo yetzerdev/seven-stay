@@ -237,6 +237,8 @@ export default function HotelAdminPage() {
               rtn: hotel.rtn,
               plan_saas: hotel.plan_saas,
               gratis_hasta: hotel.gratis_hasta,
+              direccion_fiscal: hotel.direccion_fiscal,
+              tipo_placa: hotel.tipo_placa,
               habitaciones_contratadas: hotel.habitaciones_contratadas,
             }}
             textoGuardar="Guardar cambios"
